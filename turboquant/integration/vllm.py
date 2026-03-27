@@ -180,8 +180,21 @@ def _no_alloc_prefill_attention(
     return out.squeeze(0).transpose(0, 1)
 
 
-def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False):
-    """Intercept forward to optionally use TQ decode."""
+def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
+                          capture_in_forward: bool = False):
+    """Intercept forward to optionally use TQ decode.
+    
+    If capture_in_forward=True, also capture K/V from forward args
+    (needed when the backend has no separate do_kv_cache_update method).
+    """
+
+    def _capture_kv(key, value, attn_metadata):
+        """Capture K/V tensors into TQ store."""
+        num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
+        if num_tokens <= 1:
+            state.engine.ingest_decode(key[:num_tokens], value[:num_tokens], num_tokens)
+        else:
+            state.engine.ingest_prefill(key[:num_tokens], value[:num_tokens], num_tokens)
 
     def patched(
         self_impl,
@@ -196,6 +209,10 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False):
         output_block_scale=None,
     ):
         mode = _GLOBAL_MODE
+
+        # Capture K/V when no separate kv_update hook exists
+        if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
+            _capture_kv(key, value, attn_metadata)
 
         # Off or capture-only: always use flash
         if mode in (MODE_OFF, MODE_CAPTURE_ONLY):
@@ -384,27 +401,41 @@ def install_hooks(
         layer_states[layer_name] = state
 
         if backend_kind == "flash":
-            patched_update = _make_patched_kv_update(
-                impl.do_kv_cache_update.__func__, state, no_alloc=no_alloc
-            )
+            has_separate_kv_update = hasattr(impl, "do_kv_cache_update")
+            needs_forward_capture = not has_separate_kv_update
+
+            if has_separate_kv_update:
+                patched_update = _make_patched_kv_update(
+                    impl.do_kv_cache_update.__func__, state, no_alloc=no_alloc
+                )
+                impl.do_kv_cache_update = types.MethodType(
+                    lambda self, *a, _p=patched_update, **kw: _p(self, *a, **kw), impl
+                )
+
             patched_forward = _make_patched_forward(
-                impl.forward.__func__, state, no_alloc=no_alloc
-            )
-            impl.do_kv_cache_update = types.MethodType(
-                lambda self, *a, _p=patched_update, **kw: _p(self, *a, **kw), impl
+                impl.forward.__func__, state, no_alloc=no_alloc,
+                capture_in_forward=needs_forward_capture,
             )
             impl.forward = types.MethodType(
                 lambda self, *a, _p=patched_forward, **kw: _p(self, *a, **kw), impl
             )
+
+            if needs_forward_capture and layer_idx == 0:
+                logger.info(
+                    "[TurboQuant] No do_kv_cache_update found (vLLM 0.16 FlashInfer); "
+                    "capturing K/V in forward()"
+                )
         else:
-            patched_update = _make_patched_mla_update(impl.do_kv_cache_update.__func__, state)
-            patched_fwd = _make_patched_mla_forward(impl.forward_mqa.__func__, state)
-            impl.do_kv_cache_update = types.MethodType(
-                lambda self, *a, _p=patched_update, **kw: _p(self, *a, **kw), impl
-            )
-            impl.forward_mqa = types.MethodType(
-                lambda self, *a, _p=patched_fwd, **kw: _p(self, *a, **kw), impl
-            )
+            if hasattr(impl, "do_kv_cache_update"):
+                patched_update = _make_patched_mla_update(impl.do_kv_cache_update.__func__, state)
+                impl.do_kv_cache_update = types.MethodType(
+                    lambda self, *a, _p=patched_update, **kw: _p(self, *a, **kw), impl
+                )
+            if hasattr(impl, "forward_mqa"):
+                patched_fwd = _make_patched_mla_forward(impl.forward_mqa.__func__, state)
+                impl.forward_mqa = types.MethodType(
+                    lambda self, *a, _p=patched_fwd, **kw: _p(self, *a, **kw), impl
+                )
 
         impl._tq_layer_state = state
         layer_idx += 1
