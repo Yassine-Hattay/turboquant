@@ -105,11 +105,13 @@ class TurboQuantMSE(torch.nn.Module):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
+        ip_optimized: bool = False,  # NEW: use IP-optimized codebook
     ):
         super().__init__()
         self.dim = dim
         self.bits = bits
         self.n_clusters = 2**bits
+        self.ip_optimized = ip_optimized  # Store flag
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Precompute rotation matrix
@@ -117,8 +119,9 @@ class TurboQuantMSE(torch.nn.Module):
             "Pi", generate_rotation_matrix(dim, self.device, dtype, seed=seed)
         )
 
-        # Precompute codebook
-        centroids, boundaries = get_codebook_tensors(dim, bits, self.device, dtype)
+        # Precompute codebook (optionally IP-optimized)
+        centroids, boundaries = get_codebook_tensors(dim, bits, self.device, dtype, 
+                                                      ip_optimized=ip_optimized)
         self.register_buffer("centroids", centroids)      # (2^b,)
         self.register_buffer("boundaries", boundaries)    # (2^b + 1,)
 
@@ -190,17 +193,20 @@ class TurboQuantProd(torch.nn.Module):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
+        ip_optimized: bool = False,  # NEW: use IP-optimized codebook for MSE stage
     ):
         super().__init__()
         self.dim = dim
         self.bits = bits
+        self.ip_optimized = ip_optimized  # Store flag
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         assert bits >= 2, "Inner product TurboQuant requires at least 2 bits (1 for MSE + 1 for QJL)"
 
-        # Stage 1: MSE quantizer at (b-1) bits
+        # Stage 1: MSE quantizer at (b-1) bits (optionally IP-optimized)
         self.mse_quantizer = TurboQuantMSE(
-            dim=dim, bits=bits - 1, device=self.device, dtype=dtype, seed=seed
+            dim=dim, bits=bits - 1, device=self.device, dtype=dtype, seed=seed,
+            ip_optimized=ip_optimized
         )
 
         # Stage 2: QJL projection matrix S ∈ R^{d×d}
