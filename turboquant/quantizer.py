@@ -106,17 +106,19 @@ class TurboQuantMSE(torch.nn.Module):
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
         ip_optimized: bool = False,  # NEW: use IP-optimized codebook
+        rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
     ):
         super().__init__()
         self.dim = dim
         self.bits = bits
         self.n_clusters = 2**bits
         self.ip_optimized = ip_optimized  # Store flag
+        self.rotation_type = rotation_type  # Store rotation type
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Precompute rotation matrix
         self.register_buffer(
-            "Pi", generate_rotation_matrix(dim, self.device, dtype, seed=seed)
+            "Pi", generate_rotation_matrix(dim, self.device, dtype, seed=seed, rotation_type=rotation_type)
         )
 
         # Precompute codebook (optionally IP-optimized)
@@ -194,11 +196,13 @@ class TurboQuantProd(torch.nn.Module):
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
         ip_optimized: bool = False,  # NEW: use IP-optimized codebook for MSE stage
+        rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
     ):
         super().__init__()
         self.dim = dim
         self.bits = bits
         self.ip_optimized = ip_optimized  # Store flag
+        self.rotation_type = rotation_type  # Store rotation type
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         assert bits >= 2, "Inner product TurboQuant requires at least 2 bits (1 for MSE + 1 for QJL)"
@@ -206,7 +210,7 @@ class TurboQuantProd(torch.nn.Module):
         # Stage 1: MSE quantizer at (b-1) bits (optionally IP-optimized)
         self.mse_quantizer = TurboQuantMSE(
             dim=dim, bits=bits - 1, device=self.device, dtype=dtype, seed=seed,
-            ip_optimized=ip_optimized
+            ip_optimized=ip_optimized, rotation_type=rotation_type  # PASS DOWN
         )
 
         # Stage 2: QJL projection matrix S ∈ R^{d×d}

@@ -40,6 +40,7 @@ class CompressedKVStore:
         value_group_size: int = 32,
         device: torch.device = None,
         layer_idx: int = 0,
+        rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
     ):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
@@ -48,12 +49,14 @@ class CompressedKVStore:
         self.value_group_size = min(value_group_size, head_dim)
         self.device = device or torch.device("cuda")
         self.layer_idx = layer_idx
+        self.rotation_type = rotation_type  # Store rotation type
 
         self.quantizer = TurboQuantProd(
             dim=head_dim,
             bits=key_bits,
             device=self.device,
             seed=42 + layer_idx * 7,
+            rotation_type=rotation_type,  # PASS DOWN
         )
 
         self._key_chunks: list[ProdQuantized] = []

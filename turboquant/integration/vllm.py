@@ -64,6 +64,7 @@ class LayerConfig:
     layer_idx: int = 0
     backend_kind: str = "flash"  # "flash" | "mla"
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
+    rotation_type: str = "dense"  # NEW: "dense" or "hadamard"
 
 
 @dataclass
@@ -92,6 +93,7 @@ def _create_layer_state(cfg: LayerConfig) -> LayerState:
         value_group_size=cfg.value_group_size,
         device=cfg.device,
         layer_idx=cfg.layer_idx,
+        rotation_type=cfg.rotation_type,  # PASS DOWN
     )
     engine = KVCaptureEngine(
         store=store,
@@ -347,6 +349,7 @@ def install_hooks(
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_CAPTURE_ONLY,
     no_alloc: bool = False,
+    rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
 ) -> dict[str, LayerState]:
     """Install TurboQuant hooks on all attention layers in a vLLM model runner.
 
@@ -395,6 +398,7 @@ def install_hooks(
             layer_idx=layer_idx,
             backend_kind=backend_kind,
             device=device,
+            rotation_type=rotation_type,  # PASS DOWN
         )
 
         state = _create_layer_state(cfg)
