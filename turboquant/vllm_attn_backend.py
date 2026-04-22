@@ -49,6 +49,7 @@ def install_turboquant_hooks(
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_ACCUMULATE,
     no_alloc: bool = False,
+    rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
 ):
     global _GLOBAL_MODE
     new_mode = _LEGACY_TO_NEW.get(mode, _new_backend.MODE_CAPTURE_ONLY)
@@ -63,6 +64,7 @@ def install_turboquant_hooks(
         initial_layers_key_bits=initial_layers_key_bits,
         mode=new_mode,
         no_alloc=no_alloc,
+        rotation_type=rotation_type,  # PASS DOWN
     )
 
     _GLOBAL_MODE = mode
