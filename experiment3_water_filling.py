@@ -6,7 +6,7 @@ Tests whether non-uniform bit allocation (via water-filling) improves
 D_prod when post-rotation coordinate variances are non-uniform.
 
 Precondition: Variance ratio > 1.5x after structured rotation (validated in Exp 2)
-
+test
 Building on Experiments 1 & 2:
 - Exp 1: IP-optimized codebook showed +6.39% improvement on anisotropic data
 - Exp 2: Hadamard rotation showed +6.06% improvement on anisotropic data
