@@ -5,7 +5,7 @@ TurboQuant definitive proof. Two separate subprocesses:
   2. TurboQuant + free_kv_cache
 Hard numbers side by side.
 """
-import os, sys, subprocess, json
+import os, sys, subprocess, json, argparse
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3.5-27B")
 TP = int(os.environ.get("TP", "4"))
@@ -13,6 +13,8 @@ GPU_MEM = float(os.environ.get("GPU_MEM", "0.90"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "131072"))
 GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
 PYTHON = sys.executable
+
+TQ_ROTATION = os.environ.get("TQ_ROTATION", "dense")  # default to dense
 
 
 def run_phase(name, script):
@@ -101,7 +103,7 @@ def main():
     def _install(worker):
         from turboquant.vllm_attn_backend import install_turboquant_hooks, MODE_ACTIVE
         return len(install_turboquant_hooks(worker.model_runner, key_bits=3, value_bits=2,
-            buffer_size=128, mode=MODE_ACTIVE))
+            buffer_size=128, mode=MODE_ACTIVE, rotation_type="{TQ_ROTATION}"))
     hooks = executor.collective_rpc(_install)
 
     out = llm.generate(["Explain KV cache compression in LLM inference."],
@@ -122,7 +124,7 @@ def main():
 
     print(json.dumps({{"blocks": blocks, "hooks": hooks[0], "vram_gen": vram_gen,
         "vram_freed": vram_freed, "freed_bytes": freed,
-        "text": out[0].outputs[0].text[:100]}}))
+        "text": out[0].outputs[0].text[:100], "rotation_type": "{TQ_ROTATION}"}}))
 
 if __name__ == "__main__":
     main()
@@ -192,4 +194,12 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rotation-type", type=str, default="dense", choices=["dense", "hadamard"])
+    args = parser.parse_args()
+    
+    # Update the global TQ_ROTATION for the f-string
+    import sys
+    sys.modules[__name__].TQ_ROTATION = args.rotation_type
+    
     main()
