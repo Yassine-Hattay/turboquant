@@ -174,6 +174,17 @@ def main():
     print(f"TQ_ROTATION: {TQ_ROTATION}")
     print()
 
+    # Handle --validate-real-data flag
+    if hasattr(main, 'validate_real_data') and main.validate_real_data:
+        print(">>> Running real data validation...", flush=True)
+        import subprocess
+        result = subprocess.run([sys.executable, "experiment_hadamard_real.py"], 
+                               capture_output=True, text=True)
+        print(result.stdout)
+        if result.returncode != 0:
+            print(f"Validation failed: {result.stderr}")
+        return
+
     print(">>> Phase 1: Baseline ...", flush=True)
     bl = run_phase("baseline", BASELINE)
     if not bl:
@@ -250,6 +261,8 @@ if __name__ == "__main__":
                        help="Override GPU_MEM env var (0.0-1.0)")
     parser.add_argument("--max-model-len", type=int, default=None,
                        help="Override MAX_MODEL_LEN env var")
+    parser.add_argument("--validate-real-data", action="store_true",
+                       help="Run Hadamard validation on real embeddings and exit")
     args = parser.parse_args()
     
     # Apply CLI overrides
@@ -264,5 +277,8 @@ if __name__ == "__main__":
     
     # Update the global TQ_ROTATION for the f-string
     TQ_ROTATION = args.rotation_type
+    
+    # Set validate_real_data flag
+    main.validate_real_data = args.validate_real_data
     
     main()

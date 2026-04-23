@@ -1,1 +1,4 @@
-Nothing should be ignored since the changes only include source files (.json, .py) without any build artifacts, dependencies, or temporary files.
+```
+__pycache__/
+*.pyc
+```

@@ -23,7 +23,8 @@ def load_mteb_embeddings():
         
         # Save to file
         np.save("real_embeddings_mteb.npy", vectors)
-        print(f"✓ Saved to real_embeddings_mteb.npy")
+        var_ratio = np.var(vectors, axis=0).max() / (np.var(vectors, axis=0).min() + 1e-10)
+        print(f"✓ Saved to real_embeddings_mteb.npy: shape={vectors.shape}, variance_ratio={var_ratio:.2f}x")
         
         return vectors
         
@@ -84,7 +85,8 @@ def generate_synthetic_anisotropic_embeddings(n_samples=5000, dim=384):
     print(f"  - Variance ratio: {np.max(variances)/np.min(variances):.2f}x")
     
     np.save("real_embeddings_anisotropic.npy", vectors)
-    print(f"✓ Saved to real_embeddings_anisotropic.npy")
+    var_ratio = np.var(vectors, axis=0).max() / (np.var(vectors, axis=0).min() + 1e-10)
+    print(f"✓ Saved to real_embeddings_anisotropic.npy: shape={vectors.shape}, variance_ratio={var_ratio:.2f}x")
     
     return vectors
 
@@ -130,7 +132,8 @@ def load_sentence_transformer_embeddings(n_samples=1000):
         
         print(f"✓ Generated {vectors.shape[0]} vectors of dimension {vectors.shape[1]}")
         np.save("real_embeddings_minilm.npy", vectors)
-        print(f"✓ Saved to real_embeddings_minilm.npy")
+        var_ratio = np.var(vectors, axis=0).max() / (np.var(vectors, axis=0).min() + 1e-10)
+        print(f"✓ Saved to real_embeddings_minilm.npy: shape={vectors.shape}, variance_ratio={var_ratio:.2f}x")
         
         return vectors
         

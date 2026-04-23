@@ -1,0 +1,16 @@
+{
+  "data_source": "real_embeddings_anisotropic.npy",
+  "dense": {
+    "correlation": 0.9953910112380981,
+    "d_prod": 9.872798545984551e-05,
+    "orth_error": 9.5367431640625e-07
+  },
+  "dimension": 384,
+  "hadamard": {
+    "correlation": 0.9956069588661194,
+    "d_prod": 9.232779848389328e-05,
+    "orth_error": 2.5033950805664062e-06
+  },
+  "improvement_pct": 6.482647190806209,
+  "variance_ratio": 19.18817105661955
+}
