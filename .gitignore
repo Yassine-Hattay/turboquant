@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes, as they only include source/config files (.json, .py) without any build artifacts, dependencies, or temporary files.
+Nothing should be ignored based on the provided file changes. The modified files (`experiment2_fixed_results.json` and `experiment2_fixed_rotation.py`) are source/config files that should be tracked in version control.
