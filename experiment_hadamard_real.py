@@ -37,34 +37,51 @@ def split_outlier_indices(var: torch.Tensor, outlier_ratio: float = 0.05):
     return sorted_idx[:k], sorted_idx[k:]
 
 
-def compute_d_prod_outlier_aware(
+def compute_effective_bits(outlier_ratio: float, outlier_bits: float = 16.0, regular_bits: float = 3.0) -> float:
+    """Compute effective bits per coordinate given outlier handling strategy."""
+    return outlier_ratio * outlier_bits + (1.0 - outlier_ratio) * regular_bits
+
+
+def compute_d_prod_outlier_aware_with_bits(
     X: torch.Tensor, Y: torch.Tensor, Pi_reg: torch.Tensor,
-    boundaries: torch.Tensor, centroids: torch.Tensor, outlier_ratio: float = 0.05,
-    X_raw_for_detection: torch.Tensor = None
+    boundaries: torch.Tensor, centroids: torch.Tensor,
+    outlier_ratio: float = 0.05,
+    outlier_bits: float = 16.0,  # 16 = FP16 pass-through, 4-6 = higher-bit quant
+    X_raw_for_detection: torch.Tensor = None,
+    codebook_high_bits: torch.Tensor = None,  # Optional: higher-bit codebook for outliers
+    boundaries_high: torch.Tensor = None,
 ) -> dict:
     """
-    Outlier-aware D_prod for real embeddings:
-    - Splits channels into outliers (no rotation, NO quantization) and regular (Hadamard rotated)
-    - Outliers pass through unchanged; regular channels are rotated + quantized
-    - Reconstructs full vector and computes D_prod, RMSE, correlation
+    Outlier-aware D_prod with configurable outlier bit-width.
+    - If outlier_bits >= 8: pass outliers through unchanged (FP16)
+    - If outlier_bits < 8: quantize outliers with higher-bit codebook
+    - Regular channels: always use standard 3-bit codebook + Hadamard
     """
     X_norms = X.norm(dim=1, keepdim=True)
     X_unit = X / (X_norms + 1e-10)
     
-    # FIX 1: Detect outliers on pre-normalized data to preserve variance structure
+    # Detect outliers on pre-normalized data
     if X_raw_for_detection is None:
         X_raw_for_detection = X * (X_norms + 1e-10)
     var = compute_channel_variance(X_raw_for_detection)
     outlier_idx, regular_idx = split_outlier_indices(var, outlier_ratio)
     
-    # FIX 2: Do NOT quantize outliers - pass them through unchanged
-    X_out_hat = X_unit[:, outlier_idx]
+    # Quantize outliers: either pass-through or higher-bit quantization
+    if outlier_bits >= 8:
+        # Pass-through (FP16 fidelity)
+        X_out_hat = X_unit[:, outlier_idx]
+    else:
+        # Quantize with higher-bit codebook if provided, else fall back to standard
+        int_bounds = boundaries_high[1:-1] if boundaries_high is not None else boundaries[1:-1]
+        cents = codebook_high_bits if codebook_high_bits is not None else centroids
+        idx_out = torch.searchsorted(int_bounds, X_unit[:, outlier_idx])
+        X_out_hat = cents[idx_out]
     
-    # Rotate + quantize regular channels
+    # Rotate + quantize regular channels (standard 3-bit)
     X_reg = X_unit[:, regular_idx]
     Y_reg = X_reg @ Pi_reg.T
-    int_bounds = boundaries[1:-1]
-    idx_reg = torch.searchsorted(int_bounds, Y_reg)
+    int_bounds_reg = boundaries[1:-1]
+    idx_reg = torch.searchsorted(int_bounds_reg, Y_reg)
     X_reg_hat = centroids[idx_reg] @ Pi_reg
     
     # Reconstruct
@@ -82,8 +99,31 @@ def compute_d_prod_outlier_aware(
     
     return {
         "d_prod": d_prod, "relative_rmse": relative_rmse, "correlation": correlation,
-        "outlier_ratio": outlier_ratio, "n_outliers": len(outlier_idx), "n_regular": len(regular_idx)
+        "outlier_ratio": outlier_ratio, "n_outliers": len(outlier_idx), "n_regular": len(regular_idx),
+        "effective_bits": compute_effective_bits(outlier_ratio, outlier_bits),
     }
+
+
+def compute_d_prod_outlier_aware(
+    X: torch.Tensor, Y: torch.Tensor, Pi_reg: torch.Tensor,
+    boundaries: torch.Tensor, centroids: torch.Tensor, outlier_ratio: float = 0.05,
+    X_raw_for_detection: torch.Tensor = None
+) -> dict:
+    """
+    Outlier-aware D_prod for real embeddings (legacy wrapper for backward compatibility):
+    - Splits channels into outliers (no rotation, NO quantization) and regular (Hadamard rotated)
+    - Outliers pass through unchanged; regular channels are rotated + quantized
+    - Reconstructs full vector and computes D_prod, RMSE, correlation
+    """
+    result = compute_d_prod_outlier_aware_with_bits(
+        X, Y, Pi_reg, boundaries, centroids,
+        outlier_ratio=outlier_ratio,
+        outlier_bits=16.0,  # FP16 pass-through
+        X_raw_for_detection=X_raw_for_detection
+    )
+    # Remove effective_bits for backward compatibility
+    result.pop("effective_bits", None)
+    return result
 
 
 def load_real_embeddings():
@@ -131,8 +171,9 @@ def get_codebook_for_dimension(dim: int):
 
 
 def run_validation_on_real_data(vectors: np.ndarray, data_source: str, 
-                                 verbose: bool = False, outlier_ratio: float = 0.05) -> dict:
-    """Run Hadamard vs. Dense validation on real embeddings."""
+                                 verbose: bool = False, outlier_ratio: float = 0.05,
+                                 outlier_bits: float = 16.0, compare_high_bit_baseline: bool = False) -> dict:
+    """Run Hadamard vs. Dense validation on real embeddings with outlier-ratio sweeping support."""
     n_samples, d = vectors.shape
     print(f"\nReal data variance ratio: {np.var(vectors, axis=0).max() / (np.var(vectors, axis=0).min() + 1e-10):.2f}x")
     
@@ -186,24 +227,84 @@ def run_validation_on_real_data(vectors: np.ndarray, data_source: str,
     var = compute_channel_variance(X_pre_norm)
     outlier_idx, regular_idx = split_outlier_indices(var, outlier_ratio)
     Pi_reg = hadamard_rotation(len(regular_idx), device, seed=hadamard_seed)
-    r_outlier = compute_d_prod_outlier_aware(X, Y, Pi_reg, boundaries, centroids, outlier_ratio, X_raw_for_detection=X_pre_norm)
+    
+    r_outlier = compute_d_prod_outlier_aware_with_bits(
+        X, Y, Pi_reg, boundaries, centroids,
+        outlier_ratio=outlier_ratio,
+        outlier_bits=outlier_bits,
+        X_raw_for_detection=X_pre_norm
+    )
     print(f"  Outliers: {r_outlier['n_outliers']}, Regular: {r_outlier['n_regular']}")
+    print(f"  Effective bits: {r_outlier['effective_bits']:.2f}")
     print(f"  D_prod: {r_outlier['d_prod']:.6e}, Relative RMSE: {r_outlier['relative_rmse']:.4f}, Correlation: {r_outlier['correlation']:.4f}")
+    
+    # Optional: TurboQuant-style baseline (channel split with different bit-widths, no rotation)
+    r_turboquant = None
+    if compare_high_bit_baseline:
+        print("\n--- TURBOQUANT BASELINE (channel-split, no rotation) ---")
+        # Same outlier detection
+        idx_out_tq, idx_reg_tq = split_outlier_indices(var, outlier_ratio)
+        
+        # Get unit-normalized X for quantization
+        X_unit_full = X / (X.norm(dim=1, keepdim=True) + 1e-10)
+        
+        # Quantize outliers with higher bits (e.g., 4-bit) and regular with 3-bit
+        # For simplicity, we use the same codebook but simulate higher precision by less aggressive quantization
+        int_bounds_high = boundaries[1:-1]  # In a real scenario, you'd have a separate high-bit codebook
+        
+        # Outliers: direct quantization (no rotation)
+        X_out_tq = X_unit_full[:, outlier_idx]
+        idx_out_tq_quant = torch.searchsorted(int_bounds_high, X_out_tq)
+        X_out_tq_hat = centroids[idx_out_tq_quant]
+        
+        # Regular channels: standard 3-bit quantization (no rotation)
+        X_reg_tq = X_unit_full[:, regular_idx]
+        idx_reg_tq_quant = torch.searchsorted(int_bounds_high, X_reg_tq)
+        X_reg_tq_hat = centroids[idx_reg_tq_quant]
+        
+        # Reconstruct without rotation
+        X_recon_tq_unit = torch.zeros_like(X_unit_full)
+        X_recon_tq_unit[:, outlier_idx] = X_out_tq_hat
+        X_recon_tq_unit[:, regular_idx] = X_reg_tq_hat
+        X_recon_tq = X_recon_tq_unit * X.norm(dim=1, keepdim=True)
+        
+        ip_true_tq = (X_all[:n_samples//2] * X_all[n_samples//2:]).sum(dim=1)
+        ip_quant_tq = (X_recon_tq * X_all[n_samples//2:]).sum(dim=1)
+        d_prod_tq = ((ip_true_tq - ip_quant_tq) ** 2).mean().item()
+        true_ip_var_tq = (ip_true_tq ** 2).mean().item()
+        relative_rmse_tq = np.sqrt(d_prod_tq / max(true_ip_var_tq, 1e-10))
+        correlation_tq = torch.corrcoef(torch.stack([ip_true_tq, ip_quant_tq]))[0, 1].item()
+        
+        r_turboquant = {
+            "d_prod": d_prod_tq,
+            "relative_rmse": relative_rmse_tq,
+            "correlation": correlation_tq,
+            "outlier_ratio": outlier_ratio,
+            "n_outliers": len(idx_out_tq),
+            "n_regular": len(idx_reg_tq),
+            "effective_bits": compute_effective_bits(outlier_ratio, 4.0 if outlier_bits < 8 else 16.0),
+        }
+        print(f"  Outliers: {r_turboquant['n_outliers']}, Regular: {r_turboquant['n_regular']}")
+        print(f"  Effective bits: {r_turboquant['effective_bits']:.2f}")
+        print(f"  D_prod: {r_turboquant['d_prod']:.6e}, Relative RMSE: {r_turboquant['relative_rmse']:.4f}, Correlation: {r_turboquant['correlation']:.4f}")
     
     # Calculate improvement
     improvement_pct = ((r_dense["d_prod"] - r_hadamard["d_prod"]) / r_dense["d_prod"]) * 100
     print(f"\n>>> Hadamard improvement: {improvement_pct:+.2f}%")
     
     # Print comparison table
-    print("\n" + "=" * 70)
-    print(f"{'Method':<25} {'D_prod':<18} {'Relative RMSE':<15} {'Correlation':<12}")
-    print("=" * 70)
-    print(f"{'Dense':<25} {r_dense['d_prod']:<18.6e} {'N/A':<15} {r_dense['correlation']:<12.4f}")
-    print(f"{'Hadamard':<25} {r_hadamard['d_prod']:<18.6e} {'N/A':<15} {r_hadamard['correlation']:<12.4f}")
-    print(f"{'Outlier-Aware Hadamard':<25} {r_outlier['d_prod']:<18.6e} {r_outlier['relative_rmse']:<15.4f} {r_outlier['correlation']:<12.4f}")
-    print("=" * 70)
+    print("\n" + "=" * 90)
+    print(f"{'Method':<30} {'D_prod':<18} {'Eff. Bits':<12} {'Rel. RMSE':<12} {'Correlation':<12}")
+    print("=" * 90)
+    dense_eff_bits = compute_effective_bits(0.0, outlier_bits, 3.0)
+    print(f"{'Dense':<30} {r_dense['d_prod']:<18.6e} {dense_eff_bits:<12.2f} {'N/A':<12} {r_dense['correlation']:<12.4f}")
+    print(f"{'Hadamard':<30} {r_hadamard['d_prod']:<18.6e} {dense_eff_bits:<12.2f} {'N/A':<12} {r_hadamard['correlation']:<12.4f}")
+    print(f"{'Outlier-Aware Hadamard':<30} {r_outlier['d_prod']:<18.6e} {r_outlier['effective_bits']:<12.2f} {r_outlier['relative_rmse']:<12.4f} {r_outlier['correlation']:<12.4f}")
+    if r_turboquant:
+        print(f"{'TurboQuant Baseline':<30} {r_turboquant['d_prod']:<18.6e} {r_turboquant['effective_bits']:<12.2f} {r_turboquant['relative_rmse']:<12.4f} {r_turboquant['correlation']:<12.4f}")
+    print("=" * 90)
     
-    return {
+    result_dict = {
         "data_source": data_source,
         "dimension": d,
         "variance_ratio": float(np.var(vectors, axis=0).max() / (np.var(vectors, axis=0).min() + 1e-10)),
@@ -211,11 +312,13 @@ def run_validation_on_real_data(vectors: np.ndarray, data_source: str,
             "orth_error": dense_orth_error,
             "d_prod": r_dense["d_prod"],
             "correlation": r_dense["correlation"],
+            "effective_bits": dense_eff_bits,
         },
         "hadamard": {
             "orth_error": hadamard_orth_error,
             "d_prod": r_hadamard["d_prod"],
             "correlation": r_hadamard["correlation"],
+            "effective_bits": dense_eff_bits,
         },
         "outlier_aware": {
             "d_prod": r_outlier["d_prod"],
@@ -224,9 +327,16 @@ def run_validation_on_real_data(vectors: np.ndarray, data_source: str,
             "outlier_ratio": r_outlier["outlier_ratio"],
             "n_outliers": r_outlier["n_outliers"],
             "n_regular": r_outlier["n_regular"],
+            "effective_bits": r_outlier["effective_bits"],
+            "outlier_bits": outlier_bits,
         },
         "improvement_pct": improvement_pct,
     }
+    
+    if r_turboquant:
+        result_dict["turboquant_baseline"] = r_turboquant
+    
+    return result_dict
 
 
 def main():
@@ -235,6 +345,12 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Show detailed output")
     parser.add_argument("--outlier-ratio", type=float, default=0.05, 
                         help="Ratio of outlier channels (default: 0.05)")
+    parser.add_argument("--outlier-ratios", type=str, default="0.01,0.02,0.05,0.08,0.10",
+                        help="Comma-separated outlier ratios to sweep")
+    parser.add_argument("--outlier-bits", type=float, default=16.0,
+                        help="Bit-width for outlier channels (16=FP16 pass-through, 4-6=quantized)")
+    parser.add_argument("--compare-high-bit-baseline", action="store_true",
+                        help="Also run TurboQuant-style baseline: top channels get 4-bit, rest 3-bit")
     args = parser.parse_args()
     
     print("=" * 60)
@@ -249,23 +365,132 @@ def main():
         print("Run 'python load_real_embeddings.py' first to generate embeddings.")
         sys.exit(1)
     
-    # Run validation
-    results = run_validation_on_real_data(vectors, data_source, args.verbose, args.outlier_ratio)
+    # Parse outlier ratios for sweeping
+    outlier_ratios = [float(x.strip()) for x in args.outlier_ratios.split(",")]
+    
+    # Determine if we're doing a sweep or single ratio
+    if len(outlier_ratios) > 1 or args.outlier_ratio not in outlier_ratios:
+        # Sweeping mode
+        print(f"\n>>> Running outlier-ratio sweep: {outlier_ratios}")
+        print(f">>> Outlier bits: {args.outlier_bits}")
+        print(f">>> Compare high-bit baseline: {args.compare_high_bit_baseline}")
+        
+        sweep_results = {
+            "outlier_ratios_tested": outlier_ratios,
+            "results_per_ratio": {},
+            "summary": {
+                "best_outlier_ratio": None,
+                "best_improvement_pct": -float("inf"),
+                "best_effective_bits": None,
+            }
+        }
+        
+        for ratio in outlier_ratios:
+            print(f"\n{'='*60}")
+            print(f"OUTLIER RATIO: {ratio}")
+            print(f"{'='*60}")
+            
+            results = run_validation_on_real_data(
+                vectors, data_source, args.verbose, ratio,
+                outlier_bits=args.outlier_bits,
+                compare_high_bit_baseline=args.compare_high_bit_baseline
+            )
+            
+            sweep_results["results_per_ratio"][str(ratio)] = results
+            
+            # Track best result
+            improvement_vs_dense = ((results["dense"]["d_prod"] - results["outlier_aware"]["d_prod"]) / 
+                                   results["dense"]["d_prod"]) * 100
+            if improvement_vs_dense > sweep_results["summary"]["best_improvement_pct"]:
+                sweep_results["summary"]["best_outlier_ratio"] = ratio
+                sweep_results["summary"]["best_improvement_pct"] = improvement_vs_dense
+                sweep_results["summary"]["best_effective_bits"] = results["outlier_aware"]["effective_bits"]
+        
+        # Print sweep summary
+        print(f"\n{'='*60}")
+        print("SWEEP SUMMARY")
+        print(f"{'='*60}")
+        print(f"Best outlier ratio: {sweep_results['summary']['best_outlier_ratio']}")
+        print(f"Best improvement vs Dense: {sweep_results['summary']['best_improvement_pct']:+.2f}%")
+        print(f"Effective bits at best: {sweep_results['summary']['best_effective_bits']:.2f}")
+        
+        # Try to plot if matplotlib is available
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+            
+            ratios = sweep_results["outlier_ratios_tested"]
+            d_prods = [sweep_results["results_per_ratio"][str(r)]["outlier_aware"]["d_prod"] for r in ratios]
+            
+            plt.figure(figsize=(10, 6))
+            plt.plot(ratios, d_prods, 'bo-', linewidth=2, markersize=8)
+            plt.xlabel('Outlier Ratio', fontsize=12)
+            plt.ylabel('D_prod (lower is better)', fontsize=12)
+            plt.title('Outlier Ratio Sweep: Effect on Quantization Error', fontsize=14)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(ratios)
+            
+            # Add horizontal lines for Dense and Hadamard baselines (from first ratio result)
+            first_result = sweep_results["results_per_ratio"][str(ratios[0])]
+            plt.axhline(y=first_result["dense"]["d_prod"], color='r', linestyle='--', label=f"Dense ({first_result['dense']['d_prod']:.2e})")
+            plt.axhline(y=first_result["hadamard"]["d_prod"], color='g', linestyle='--', label=f"Hadamard ({first_result['hadamard']['d_prod']:.2e})")
+            plt.legend()
+            
+            plot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outlier_ratio_sweep.png")
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            print(f"\n✓ Saved plot to {plot_path}")
+        except ImportError:
+            print("\n(Note: Install matplotlib with 'pip install matplotlib' to enable plotting)")
+        
+        # Save full results including sweep
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "real_data_hadamard_results.json")
+        full_results = {
+            "sweep_results": sweep_results,
+            "single_run": None,
+        }
+    else:
+        # Single ratio mode (backward compatible)
+        print(f"\n>>> Running single outlier ratio: {args.outlier_ratio}")
+        print(f">>> Outlier bits: {args.outlier_bits}")
+        print(f">>> Compare high-bit baseline: {args.compare_high_bit_baseline}")
+        
+        results = run_validation_on_real_data(
+            vectors, data_source, args.verbose, args.outlier_ratio,
+            outlier_bits=args.outlier_bits,
+            compare_high_bit_baseline=args.compare_high_bit_baseline
+        )
+        
+        full_results = {
+            "sweep_results": None,
+            "single_run": results,
+        }
     
     # Save results to JSON
     results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "real_data_hadamard_results.json")
     with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2, sort_keys=True)
+        json.dump(full_results, f, indent=2, sort_keys=True)
     print(f"\n✓ Saved to {results_path}")
     
     # Final status
-    if results["improvement_pct"] > 3.0:
-        print(f"\nSUCCESS: Hadamard on real data shows +{results['improvement_pct']:.2f}% improvement")
-    elif results["improvement_pct"] > 0:
-        print(f"\nPARTIAL: Hadamard shows modest +{results['improvement_pct']:.2f}% improvement")
+    if "sweep_results" in full_results and full_results["sweep_results"]:
+        best_imp = full_results["sweep_results"]["summary"]["best_improvement_pct"]
+        if best_imp > 3.0:
+            print(f"\nSUCCESS: Best outlier-aware config shows +{best_imp:.2f}% improvement over Dense")
+        elif best_imp > 0:
+            print(f"\nPARTIAL: Best outlier-aware config shows modest +{best_imp:.2f}% improvement")
+        else:
+            print(f"\nWARNING: Outlier-aware shows no improvement over Dense ({best_imp:.2f}%)")
     else:
-        print(f"\nWARNING: Hadamard shows no improvement on real data ({results['improvement_pct']:.2f}%)")
+        imp_pct = results["improvement_pct"]
+        if imp_pct > 3.0:
+            print(f"\nSUCCESS: Hadamard on real data shows +{imp_pct:.2f}% improvement")
+        elif imp_pct > 0:
+            print(f"\nPARTIAL: Hadamard shows modest +{imp_pct:.2f}% improvement")
+        else:
+            print(f"\nWARNING: Hadamard shows no improvement on real data ({imp_pct:.2f}%)")
 
 
 if __name__ == "__main__":

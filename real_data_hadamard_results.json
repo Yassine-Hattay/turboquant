@@ -1,24 +1,159 @@
 {
-  "data_source": "real_embeddings_anisotropic.npy",
-  "dense": {
-    "correlation": 0.9953910112380981,
-    "d_prod": 9.872798545984551e-05,
-    "orth_error": 9.5367431640625e-07
-  },
-  "dimension": 384,
-  "hadamard": {
-    "correlation": 0.9956069588661194,
-    "d_prod": 9.232779848389328e-05,
-    "orth_error": 2.5033950805664062e-06
-  },
-  "improvement_pct": 6.482647190806209,
-  "outlier_aware": {
-    "correlation": 0.9980108737945557,
-    "d_prod": 3.97201074520126e-05,
-    "n_outliers": 30,
-    "n_regular": 354,
-    "outlier_ratio": 0.08,
-    "relative_rmse": 0.06306074006888547
-  },
-  "variance_ratio": 19.18817105661955
+  "single_run": null,
+  "sweep_results": {
+    "outlier_ratios_tested": [
+      0.01,
+      0.02,
+      0.05,
+      0.08,
+      0.1
+    ],
+    "results_per_ratio": {
+      "0.01": {
+        "data_source": "real_embeddings_anisotropic.npy",
+        "dense": {
+          "correlation": 0.9953910112380981,
+          "d_prod": 9.872798545984551e-05,
+          "effective_bits": 3.0,
+          "orth_error": 9.5367431640625e-07
+        },
+        "dimension": 384,
+        "hadamard": {
+          "correlation": 0.9956069588661194,
+          "d_prod": 9.232779848389328e-05,
+          "effective_bits": 3.0,
+          "orth_error": 2.5033950805664062e-06
+        },
+        "improvement_pct": 6.482647190806209,
+        "outlier_aware": {
+          "correlation": 0.9959892630577087,
+          "d_prod": 8.141899161273614e-05,
+          "effective_bits": 3.13,
+          "n_outliers": 3,
+          "n_regular": 381,
+          "outlier_bits": 16.0,
+          "outlier_ratio": 0.01,
+          "relative_rmse": 0.0902852314114721
+        },
+        "variance_ratio": 19.18817105661955
+      },
+      "0.02": {
+        "data_source": "real_embeddings_anisotropic.npy",
+        "dense": {
+          "correlation": 0.9953910112380981,
+          "d_prod": 9.872798545984551e-05,
+          "effective_bits": 3.0,
+          "orth_error": 9.5367431640625e-07
+        },
+        "dimension": 384,
+        "hadamard": {
+          "correlation": 0.9956069588661194,
+          "d_prod": 9.232779848389328e-05,
+          "effective_bits": 3.0,
+          "orth_error": 2.5033950805664062e-06
+        },
+        "improvement_pct": 6.482647190806209,
+        "outlier_aware": {
+          "correlation": 0.9969704747200012,
+          "d_prod": 6.057236896594986e-05,
+          "effective_bits": 3.26,
+          "n_outliers": 7,
+          "n_regular": 377,
+          "outlier_bits": 16.0,
+          "outlier_ratio": 0.02,
+          "relative_rmse": 0.07787375840220734
+        },
+        "variance_ratio": 19.18817105661955
+      },
+      "0.05": {
+        "data_source": "real_embeddings_anisotropic.npy",
+        "dense": {
+          "correlation": 0.9953910112380981,
+          "d_prod": 9.872798545984551e-05,
+          "effective_bits": 3.0,
+          "orth_error": 9.5367431640625e-07
+        },
+        "dimension": 384,
+        "hadamard": {
+          "correlation": 0.9956069588661194,
+          "d_prod": 9.232779848389328e-05,
+          "effective_bits": 3.0,
+          "orth_error": 2.5033950805664062e-06
+        },
+        "improvement_pct": 6.482647190806209,
+        "outlier_aware": {
+          "correlation": 0.9978709816932678,
+          "d_prod": 4.2558331188047305e-05,
+          "effective_bits": 3.6499999999999995,
+          "n_outliers": 19,
+          "n_regular": 365,
+          "outlier_bits": 16.0,
+          "outlier_ratio": 0.05,
+          "relative_rmse": 0.06527489033381785
+        },
+        "variance_ratio": 19.18817105661955
+      },
+      "0.08": {
+        "data_source": "real_embeddings_anisotropic.npy",
+        "dense": {
+          "correlation": 0.9953910112380981,
+          "d_prod": 9.872798545984551e-05,
+          "effective_bits": 3.0,
+          "orth_error": 9.5367431640625e-07
+        },
+        "dimension": 384,
+        "hadamard": {
+          "correlation": 0.9956069588661194,
+          "d_prod": 9.232779848389328e-05,
+          "effective_bits": 3.0,
+          "orth_error": 2.5033950805664062e-06
+        },
+        "improvement_pct": 6.482647190806209,
+        "outlier_aware": {
+          "correlation": 0.9980108737945557,
+          "d_prod": 3.97201074520126e-05,
+          "effective_bits": 4.04,
+          "n_outliers": 30,
+          "n_regular": 354,
+          "outlier_bits": 16.0,
+          "outlier_ratio": 0.08,
+          "relative_rmse": 0.06306074006888547
+        },
+        "variance_ratio": 19.18817105661955
+      },
+      "0.1": {
+        "data_source": "real_embeddings_anisotropic.npy",
+        "dense": {
+          "correlation": 0.9953910112380981,
+          "d_prod": 9.872798545984551e-05,
+          "effective_bits": 3.0,
+          "orth_error": 9.5367431640625e-07
+        },
+        "dimension": 384,
+        "hadamard": {
+          "correlation": 0.9956069588661194,
+          "d_prod": 9.232779848389328e-05,
+          "effective_bits": 3.0,
+          "orth_error": 2.5033950805664062e-06
+        },
+        "improvement_pct": 6.482647190806209,
+        "outlier_aware": {
+          "correlation": 0.9980083107948303,
+          "d_prod": 3.9799095247872174e-05,
+          "effective_bits": 4.300000000000001,
+          "n_outliers": 38,
+          "n_regular": 346,
+          "outlier_bits": 16.0,
+          "outlier_ratio": 0.1,
+          "relative_rmse": 0.06312341053116668
+        },
+        "variance_ratio": 19.18817105661955
+      }
+    },
+    "summary": {
+      "best_effective_bits": 4.04,
+      "best_improvement_pct": 59.76813740601696,
+      "best_outlier_ratio": 0.08
+    }
+  }
 }
