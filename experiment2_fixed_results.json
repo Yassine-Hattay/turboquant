@@ -1,0 +1,23 @@
+{
+  "config": {
+    "bits": 3,
+    "dimension": 128,
+    "n_samples": 5000,
+    "seed": 42
+  },
+  "dense": {
+    "correlation": 0.9792462587356567,
+    "d_prod": 0.00034690677421167493,
+    "orthogonality_error": 4.76837158203125e-07,
+    "relative_rmse": 0.2026825459186901,
+    "variance_ratio": 1.2965458631515503
+  },
+  "hadamard": {
+    "correlation": 0.984578549861908,
+    "d_prod": 0.00025848083896562457,
+    "orthogonality_error": 1.8605256002501847e-07,
+    "relative_rmse": 0.17495410539124429,
+    "variance_ratio": 1.1417139768600464
+  },
+  "improvement_pct": 25.48982661033157
+}
