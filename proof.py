@@ -16,6 +16,8 @@ GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
 PYTHON = sys.executable
 
 TQ_ROTATION = os.environ.get("TQ_ROTATION", "dense")  # default to dense
+TQ_OUTLIER_RATIO = float(os.environ.get("TQ_OUTLIER_RATIO", "0.08"))
+TQ_OUTLIER_BITS = float(os.environ.get("TQ_OUTLIER_BITS", "16.0"))
 
 
 def run_phase(name, script):
@@ -132,7 +134,8 @@ def main():
     def _install(worker):
         from turboquant.vllm_attn_backend import install_turboquant_hooks, MODE_ACTIVE
         return len(install_turboquant_hooks(worker.model_runner, key_bits=3, value_bits=2,
-            buffer_size=128, mode=MODE_ACTIVE, rotation_type="{TQ_ROTATION}"))
+            buffer_size=128, mode=MODE_ACTIVE, rotation_type="{TQ_ROTATION}",
+            outlier_ratio={TQ_OUTLIER_RATIO}, outlier_bits={TQ_OUTLIER_BITS}))
     hooks = executor.collective_rpc(_install)
     print(f"[TQ] Hooks installed on {{hooks[0]}} layers", flush=True)
 
@@ -254,6 +257,10 @@ if __name__ == "__main__":
     parser.add_argument("--rotation-type", type=str, default="dense", 
                        choices=["dense", "hadamard"],
                        help="Rotation type for TurboQuant (default: dense)")
+    parser.add_argument("--outlier-ratio", type=float, default=0.08,
+                       help="Fraction of channels to treat as outliers (default: 0.08)")
+    parser.add_argument("--outlier-bits", type=float, default=16.0,
+                       help="Bit-width for outliers: 16=FP16 pass-through (default: 16.0)")
     parser.add_argument("--model", type=str, default=None,
                        help="Override MODEL env var")
     parser.add_argument("--tp", type=int, default=None,
@@ -278,6 +285,8 @@ if __name__ == "__main__":
     
     # Update the global TQ_ROTATION for the f-string
     TQ_ROTATION = args.rotation_type
+    TQ_OUTLIER_RATIO = args.outlier_ratio
+    TQ_OUTLIER_BITS = args.outlier_bits
     
     # Set validate_real_data flag
     main.validate_real_data = args.validate_real_data
