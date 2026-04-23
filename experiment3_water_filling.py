@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# experiment3_water_filling.py
 """
 Experiment 3: Water-Filling Bit Allocation on Anisotropic Embeddings
 =====================================================================

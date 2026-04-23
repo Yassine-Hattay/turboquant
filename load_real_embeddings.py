@@ -1,3 +1,4 @@
+# load_real_embeddings.py
 """
 Load real-world embeddings for rigorous validation of Experiments 1 & 2.
 Downloads pre-computed embeddings from MTEB benchmark (Banking77 dataset).

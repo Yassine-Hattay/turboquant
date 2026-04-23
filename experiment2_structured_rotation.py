@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# experiment2_structured_rotation.py
 """
 Experiment 2: Structured Rotations for TurboQuant
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# proof.py
 """
 TurboQuant definitive proof. Two separate subprocesses:
   1. Baseline vLLM

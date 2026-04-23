@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# experiment_hadamard_real.py
 """
 Validate Hadamard rotation on real embeddings.
 
