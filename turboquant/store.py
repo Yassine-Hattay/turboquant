@@ -40,7 +40,9 @@ class CompressedKVStore:
         value_group_size: int = 32,
         device: torch.device = None,
         layer_idx: int = 0,
-        rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
+        rotation_type: str = "dense",  # "dense" or "hadamard"
+        outlier_ratio: float = 0.08,   # Fraction of channels to treat as outliers
+        outlier_bits: float = 16.0,    # Bit-width for outliers: 16=FP16 pass-through
     ):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
@@ -50,6 +52,8 @@ class CompressedKVStore:
         self.device = device or torch.device("cuda")
         self.layer_idx = layer_idx
         self.rotation_type = rotation_type  # Store rotation type
+        self.outlier_ratio = outlier_ratio  # Store outlier ratio
+        self.outlier_bits = outlier_bits    # Store outlier bits
 
         self.quantizer = TurboQuantProd(
             dim=head_dim,
@@ -57,6 +61,8 @@ class CompressedKVStore:
             device=self.device,
             seed=42 + layer_idx * 7,
             rotation_type=rotation_type,  # PASS DOWN
+            outlier_ratio=outlier_ratio,  # PASS DOWN
+            outlier_bits=outlier_bits,    # PASS DOWN
         )
 
         self._key_chunks: list[ProdQuantized] = []
@@ -145,6 +151,8 @@ def _flatten_prod_q(pq: ProdQuantized) -> ProdQuantized:
         residual_norms=pq.residual_norms.reshape(-1, pq.residual_norms.shape[-1]).contiguous(),
         norms=pq.norms.reshape(-1, pq.norms.shape[-1]).contiguous(),
         mse_bits=pq.mse_bits,
+        outlier_indices=pq.outlier_indices,  # Preserve outlier indices
+        outlier_quantized=pq.outlier_quantized,  # Preserve flag
     )
 
 
@@ -167,6 +175,8 @@ def _concat_prod_q(chunks: list[ProdQuantized]) -> ProdQuantized:
         residual_norms=torch.cat([c.residual_norms for c in chunks], dim=-1),
         norms=torch.cat([c.norms for c in chunks], dim=-1),
         mse_bits=chunks[0].mse_bits,
+        outlier_indices=chunks[0].outlier_indices,  # Same for all chunks
+        outlier_quantized=chunks[0].outlier_quantized,  # Same for all chunks
     )
 
 
