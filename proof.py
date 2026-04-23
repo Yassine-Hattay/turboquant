@@ -8,10 +8,10 @@ Hard numbers side by side.
 """
 import os, sys, subprocess, json, argparse
 
-MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 TP = int(os.environ.get("TP", "1"))
-GPU_MEM = float(os.environ.get("GPU_MEM", "0.90"))  # Increased default from 0.5 to 0.9
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768"))
+GPU_MEM = float(os.environ.get("GPU_MEM", "0.7"))  # Increased default from 0.5 to 0.9
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "4096"))
 GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 PYTHON = sys.executable
 
