@@ -24,6 +24,83 @@ from experiment2_fixed_rotation import (
 )
 
 
+def run_outlier_aware_single_seed(
+    vectors: np.ndarray,
+    data_seed: int,
+    hadamard_seed: int,
+    outlier_ratio: float,
+    boundaries: torch.Tensor,
+    centroids: torch.Tensor,
+    device: torch.device,
+    verbose: bool = False
+) -> dict:
+    """
+    Run outlier-aware Hadamard validation for a single data seed.
+    Returns metrics dict with d_prod, correlation, etc.
+    """
+    n_samples, d = vectors.shape
+    
+    # Regenerate data with this seed (re-shuffle/split)
+    rng = np.random.default_rng(data_seed)
+    indices = rng.permutation(n_samples)
+    vectors_shuffled = vectors[indices]
+    
+    # Convert to torch and normalize
+    X_all = torch.tensor(vectors_shuffled, device=device, dtype=torch.float32)
+    X_all = X_all / (X_all.norm(dim=1, keepdim=True) + 1e-10)
+    
+    # Split into X (keys) and Y (queries)
+    X = X_all[:n_samples//2]
+    Y = X_all[n_samples//2:]
+    
+    # Detect outliers on pre-normalized data (preserve variance structure)
+    X_pre_norm = vectors_shuffled[:n_samples//2]  # before unit normalization
+    var = torch.tensor(np.var(X_pre_norm, axis=0), device=device)
+    sorted_idx = torch.argsort(var, descending=True)
+    k = max(1, int(d * outlier_ratio))
+    outlier_idx = sorted_idx[:k]
+    regular_idx = sorted_idx[k:]
+    
+    # Build Hadamard rotation for regular channels only
+    Pi_reg = hadamard_rotation(len(regular_idx), device, seed=hadamard_seed)
+    
+    # Quantize outliers: pass-through (FP16 fidelity)
+    X_unit = X / (X.norm(dim=1, keepdim=True) + 1e-10)
+    X_out_hat = X_unit[:, outlier_idx]
+    
+    # Rotate + quantize regular channels
+    X_reg = X_unit[:, regular_idx]
+    Y_reg = X_reg @ Pi_reg.T
+    int_bounds = boundaries[1:-1]
+    idx_reg = torch.searchsorted(int_bounds, Y_reg)
+    X_reg_hat = centroids[idx_reg] @ Pi_reg
+    
+    # Reconstruct full vector
+    X_recon_unit = torch.zeros_like(X_unit)
+    X_recon_unit[:, outlier_idx] = X_out_hat
+    X_recon_unit[:, regular_idx] = X_reg_hat
+    X_recon = X_recon_unit * X.norm(dim=1, keepdim=True)
+    
+    # Compute D_prod
+    ip_true = (X * Y).sum(dim=1)
+    ip_quant = (X_recon * Y).sum(dim=1)
+    d_prod = ((ip_true - ip_quant) ** 2).mean().item()
+    true_ip_var = (ip_true ** 2).mean().item()
+    relative_rmse = np.sqrt(d_prod / max(true_ip_var, 1e-10))
+    correlation = torch.corrcoef(torch.stack([ip_true, ip_quant]))[0, 1].item()
+    
+    return {
+        "data_seed": data_seed,
+        "d_prod": d_prod,
+        "relative_rmse": relative_rmse,
+        "correlation": correlation,
+        "outlier_ratio": outlier_ratio,
+        "n_outliers": len(outlier_idx),
+        "n_regular": len(regular_idx),
+        "effective_bits": outlier_ratio * 16.0 + (1.0 - outlier_ratio) * 3.0,
+    }
+
+
 def compute_channel_variance(X: torch.Tensor) -> torch.Tensor:
     """Compute per-channel variance across samples."""
     return X.var(dim=0)
@@ -351,6 +428,10 @@ def main():
                         help="Bit-width for outlier channels (16=FP16 pass-through, 4-6=quantized)")
     parser.add_argument("--compare-high-bit-baseline", action="store_true",
                         help="Also run TurboQuant-style baseline: top channels get 4-bit, rest 3-bit")
+    parser.add_argument("--data-seeds", type=str, default="42,123,777",
+                        help="Comma-separated data seeds for robustness test (default: 42,123,777)")
+    parser.add_argument("--hadamard-seed", type=int, default=1337,
+                        help="Fixed seed for Hadamard rotation (default: 1337)")
     args = parser.parse_args()
     
     print("=" * 60)
@@ -368,8 +449,132 @@ def main():
     # Parse outlier ratios for sweeping
     outlier_ratios = [float(x.strip()) for x in args.outlier_ratios.split(",")]
     
-    # Determine if we're doing a sweep or single ratio
-    if len(outlier_ratios) > 1 or args.outlier_ratio not in outlier_ratios:
+    # Parse data seeds for robustness testing
+    data_seeds = [int(x.strip()) for x in args.data_seeds.split(",")]
+    is_multi_seed = len(data_seeds) > 1
+    
+    # Load codebook once (shared across all runs)
+    _, d = vectors.shape
+    boundaries, centroids = get_codebook_for_dimension(d)
+    
+    if is_multi_seed:
+        # Multi-seed robustness testing mode
+        print(f"\n>>> Running multi-seed robustness test with {len(data_seeds)} seeds: {data_seeds}")
+        print(f">>> Outlier ratio: {args.outlier_ratio}, Hadamard seed: {args.hadamard_seed}")
+        
+        # Run baselines once (fixed seed)
+        print("\n" + "=" * 60)
+        print("BASELINE RESULTS (single run, fixed seed)")
+        print("=" * 60)
+        
+        X_all_baseline = torch.tensor(vectors, device=device, dtype=torch.float32)
+        X_all_baseline = X_all_baseline / (X_all_baseline.norm(dim=1, keepdim=True) + 1e-10)
+        X_base = X_all_baseline[:len(vectors)//2]
+        Y_base = X_all_baseline[len(vectors)//2:]
+        
+        Pi_dense_base = dense_rotation(d, device, seed=42)
+        Pi_hadamard_base = hadamard_rotation(d, device, seed=args.hadamard_seed)
+        
+        r_dense_base = compute_d_prod_manual(X_base, Y_base, Pi_dense_base, boundaries, centroids)
+        r_hadamard_base = compute_d_prod_manual(X_base, Y_base, Pi_hadamard_base, boundaries, centroids)
+        
+        print(f"Dense D_prod:   {r_dense_base['d_prod']:.6e}")
+        print(f"Hadamard D_prod: {r_hadamard_base['d_prod']:.6e}")
+        baseline_improvement = ((r_dense_base["d_prod"] - r_hadamard_base["d_prod"]) / r_dense_base["d_prod"]) * 100
+        print(f"Hadamard improvement: {baseline_improvement:+.2f}%")
+        
+        # Run outlier-aware for each data seed
+        print("\n" + "=" * 60)
+        print("OUTLIER-AWARE HADAMARD (multi-seed)")
+        print("=" * 60)
+        
+        outlier_results_per_seed = []
+        for seed in data_seeds:
+            result = run_outlier_aware_single_seed(
+                vectors, seed, args.hadamard_seed, args.outlier_ratio,
+                boundaries, centroids, device, args.verbose
+            )
+            outlier_results_per_seed.append(result)
+            
+            improvement_vs_dense = ((r_dense_base["d_prod"] - result["d_prod"]) / r_dense_base["d_prod"]) * 100
+            print(f"Seed {seed}: D_prod={result['d_prod']:.6e}, Rel.RMSE={result['relative_rmse']:.4f}, "
+                  f"Corr={result['correlation']:.4f}, Improvement={improvement_vs_dense:+.2f}%")
+        
+        # Compute statistics
+        d_prods = [r["d_prod"] for r in outlier_results_per_seed]
+        rmse_vals = [r["relative_rmse"] for r in outlier_results_per_seed]
+        corr_vals = [r["correlation"] for r in outlier_results_per_seed]
+        improvements = [((r_dense_base["d_prod"] - r["d_prod"]) / r_dense_base["d_prod"]) * 100 
+                       for r in outlier_results_per_seed]
+        
+        mean_d_prod = np.mean(d_prods)
+        std_d_prod = np.std(d_prods)
+        mean_rmse = np.mean(rmse_vals)
+        std_rmse = np.std(rmse_vals)
+        mean_corr = np.mean(corr_vals)
+        std_corr = np.std(corr_vals)
+        mean_imp = np.mean(improvements)
+        std_imp = np.std(improvements)
+        
+        # Print summary table
+        print("\n" + "=" * 90)
+        print(f"{'Data Seed':<12} {'D_prod':<14} {'Rel. RMSE':<12} {'Correlation':<14} {'Improvement vs Dense':<20}")
+        print("=" * 90)
+        for i, seed in enumerate(data_seeds):
+            r = outlier_results_per_seed[i]
+            imp = improvements[i]
+            print(f"{seed:<12} {r['d_prod']:<14.6e} {r['relative_rmse']:<12.4f} {r['correlation']:<14.4f} {imp:>+13.2f}%")
+        print("-" * 90)
+        print(f"{'MEAN ± STD':<12} {mean_d_prod:<14.6e} {mean_rmse:<12.4f} {mean_corr:<14.4f} {mean_imp:>+13.2f}%")
+        print(f"{'±STD':<12} {'±'+f'{std_d_prod:.6e}':<14} {'±'+f'{std_rmse:.4f}':<12} {'±'+f'{std_corr:.4f}':<14} {'±'+f'{std_imp:.2f}%':>13}")
+        print("=" * 90)
+        
+        # Build results dict
+        full_results = {
+            "robustness": {
+                "data_seeds_tested": data_seeds,
+                "outlier_ratio": args.outlier_ratio,
+                "hadamard_seed": args.hadamard_seed,
+                "baseline_dense": {
+                    "d_prod": r_dense_base["d_prod"],
+                    "correlation": r_dense_base["correlation"],
+                },
+                "baseline_hadamard": {
+                    "d_prod": r_hadamard_base["d_prod"],
+                    "correlation": r_hadamard_base["correlation"],
+                },
+                "outlier_aware_per_seed": outlier_results_per_seed,
+                "summary": {
+                    "mean_d_prod": float(mean_d_prod),
+                    "std_d_prod": float(std_d_prod),
+                    "mean_relative_rmse": float(mean_rmse),
+                    "std_relative_rmse": float(std_rmse),
+                    "mean_correlation": float(mean_corr),
+                    "std_correlation": float(std_corr),
+                    "mean_improvement_pct": float(mean_imp),
+                    "std_improvement_pct": float(std_imp),
+                }
+            },
+            "sweep_results": None,
+            "single_run": None,
+        }
+        
+        # Save results to JSON
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "real_data_hadamard_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(full_results, f, indent=2, sort_keys=True)
+        print(f"\n✓ Saved to {results_path}")
+        
+        # Final status
+        if mean_imp > 3.0:
+            print(f"\nSUCCESS: Outlier-aware shows +{mean_imp:.2f}% ± {std_imp:.2f}% improvement over Dense (robust across seeds)")
+        elif mean_imp > 0:
+            print(f"\nPARTIAL: Outlier-aware shows modest +{mean_imp:.2f}% ± {std_imp:.2f}% improvement")
+        else:
+            print(f"\nWARNING: Outlier-aware shows no consistent improvement over Dense ({mean_imp:.2f}% ± {std_imp:.2f}%)")
+    
+    elif len(outlier_ratios) > 1 or args.outlier_ratio not in outlier_ratios:
         # Sweeping mode
         print(f"\n>>> Running outlier-ratio sweep: {outlier_ratios}")
         print(f">>> Outlier bits: {args.outlier_bits}")
@@ -467,30 +672,32 @@ def main():
             "single_run": results,
         }
     
-    # Save results to JSON
-    results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "real_data_hadamard_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(full_results, f, indent=2, sort_keys=True)
-    print(f"\n✓ Saved to {results_path}")
+    # Save results to JSON (skip if multi-seed mode already saved)
+    if not is_multi_seed:
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "real_data_hadamard_results.json")
+        with open(results_path, 'w') as f:
+            json.dump(full_results, f, indent=2, sort_keys=True)
+        print(f"\n✓ Saved to {results_path}")
     
-    # Final status
-    if "sweep_results" in full_results and full_results["sweep_results"]:
-        best_imp = full_results["sweep_results"]["summary"]["best_improvement_pct"]
-        if best_imp > 3.0:
-            print(f"\nSUCCESS: Best outlier-aware config shows +{best_imp:.2f}% improvement over Dense")
-        elif best_imp > 0:
-            print(f"\nPARTIAL: Best outlier-aware config shows modest +{best_imp:.2f}% improvement")
+    # Final status (skip if multi-seed mode already printed status)
+    if not is_multi_seed:
+        if "sweep_results" in full_results and full_results["sweep_results"]:
+            best_imp = full_results["sweep_results"]["summary"]["best_improvement_pct"]
+            if best_imp > 3.0:
+                print(f"\nSUCCESS: Best outlier-aware config shows +{best_imp:.2f}% improvement over Dense")
+            elif best_imp > 0:
+                print(f"\nPARTIAL: Best outlier-aware config shows modest +{best_imp:.2f}% improvement")
+            else:
+                print(f"\nWARNING: Outlier-aware shows no improvement over Dense ({best_imp:.2f}%)")
         else:
-            print(f"\nWARNING: Outlier-aware shows no improvement over Dense ({best_imp:.2f}%)")
-    else:
-        imp_pct = results["improvement_pct"]
-        if imp_pct > 3.0:
-            print(f"\nSUCCESS: Hadamard on real data shows +{imp_pct:.2f}% improvement")
-        elif imp_pct > 0:
-            print(f"\nPARTIAL: Hadamard shows modest +{imp_pct:.2f}% improvement")
-        else:
-            print(f"\nWARNING: Hadamard shows no improvement on real data ({imp_pct:.2f}%)")
+            imp_pct = results["improvement_pct"]
+            if imp_pct > 3.0:
+                print(f"\nSUCCESS: Hadamard on real data shows +{imp_pct:.2f}% improvement")
+            elif imp_pct > 0:
+                print(f"\nPARTIAL: Hadamard shows modest +{imp_pct:.2f}% improvement")
+            else:
+                print(f"\nWARNING: Hadamard shows no improvement on real data ({imp_pct:.2f}%)")
 
 
 if __name__ == "__main__":
