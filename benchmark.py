@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# benchmark.py
 """
 TurboQuant comprehensive benchmark.
 Tests: VRAM, throughput (tok/s), quality, context capacity.

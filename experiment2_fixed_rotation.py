@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# experiment2_fixed_rotation.py
 """
 Experiment 2 Fixed: Manual D_prod computation bypassing broken rotation injection.
 

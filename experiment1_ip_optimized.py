@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# experiment1_ip_optimized.py
 """
 Experiment 1: Validate IP-optimized Lloyd-Max codebook for TurboQuant.
 
