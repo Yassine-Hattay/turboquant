@@ -368,43 +368,49 @@ def main():
         print("ISOTROPIC CONTROL EXPERIMENT")
         print("=" * 60)
         iso_results_list = []
-        for seed in seeds:
-            result = run_isotropic_control(seed, hadamard_seeds[0], d, n_samples,
-                                           boundaries, centroids, verbose)
-            iso_results_list.append(result)
-            if verbose:
-                print(f"Seed {seed}: isotropic improvement = {result['improvement_pct']:+.2f}%")
+        for h_seed in hadamard_seeds:  # Loop over ALL Hadamard seeds
+            for seed in seeds:          # Loop over all data seeds
+                result = run_isotropic_control(seed, h_seed, d, n_samples,
+                                               boundaries, centroids, verbose)
+                iso_results_list.append(result)
+                if verbose:
+                    print(f"  Data seed {seed}, Hadamard seed {h_seed}: {result['improvement_pct']:+.2f}%")
         
-        iso_mean = np.mean([r["improvement_pct"] for r in iso_results_list])
-        iso_std = np.std([r["improvement_pct"] for r in iso_results_list])
-        print(f"\nIsotropic control summary:")
+        iso_improvements = [r["improvement_pct"] for r in iso_results_list]
+        iso_mean = np.mean(iso_improvements)
+        iso_std = np.std(iso_improvements)
+        print(f"\nIsotropic control summary (across {len(hadamard_seeds)} Hadamard seeds × {len(seeds)} data seeds):")
         print(f"  Mean improvement: {iso_mean:+.2f}%")
         print(f"  Std deviation:    ±{iso_std:.2f}%")
+        print(f"  Range:            [{min(iso_improvements):+.2f}%, {max(iso_improvements):+.2f}%]")
         
         isotropic_results = {
-            "seeds_tested": seeds,
+            "data_seeds_tested": seeds,
+            "hadamard_seeds_tested": hadamard_seeds,
             "improvements": [float(r["improvement_pct"]) for r in iso_results_list],
             "mean_improvement_pct": float(iso_mean),
             "std_improvement_pct": float(iso_std),
+            "n_trials": len(iso_results_list),
         }
         output_results["isotropic_control"] = isotropic_results
         
         # Print final comparison table
+        aniso_n_trials = len(hadamard_seeds) * len(seeds)
         print("\n" + "=" * 60)
         print("FINAL COMPARISON: Anisotropic vs Isotropic")
         print("=" * 60)
-        print(f"{'Condition':<25} {'Mean Improvement':<18} {'Std'}")
-        print("-" * 60)
-        print(f"{'Anisotropic (4x var)':<25} {mean_imp:+.2f}%{'':<13} ±{std_imp:.2f}%")
-        print(f"{'Isotropic (1x var)':<25} {iso_mean:+.2f}%{'':<13} ±{iso_std:.2f}%")
-        print("-" * 60)
+        print(f"{'Condition':<25} {'Mean Improvement':<18} {'Std':<10} {'n_trials'}")
+        print("-" * 70)
+        print(f"{'Anisotropic (4x var)':<25} {mean_imp:+.2f}%{'':<13} ±{std_imp:.2f}%{'':<5} {aniso_n_trials}")
+        print(f"{'Isotropic (1x var)':<25} {iso_mean:+.2f}%{'':<13} ±{iso_std:.2f}%{'':<5} {len(iso_results_list)}")
+        print("-" * 70)
         # Note: Hadamard shows improvement for both anisotropic and isotropic data
         # This indicates the benefit comes from Hadamard's structured properties,
         # not just better handling of anisotropy. The effect is general.
-        if mean_imp > 10.0:
-            print("RESULT: Hadamard rotation provides consistent improvement ✓")
+        if abs(iso_mean) < 5.0:
+            print("RESULT: Improvement is anisotropy-dependent ✓")
         else:
-            print("RESULT: Check implementation - improvement not significant")
+            print("RESULT: Hadamard improvement is GENERAL (not anisotropy-dependent) ✓")
     
     results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
                                  "experiment2_fixed_results.json")
