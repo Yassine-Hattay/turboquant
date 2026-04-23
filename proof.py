@@ -9,10 +9,10 @@ Hard numbers side by side.
 import os, sys, subprocess, json, argparse
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
-TP = int(os.environ.get("TP", "4"))
+TP = int(os.environ.get("TP", "1"))
 GPU_MEM = float(os.environ.get("GPU_MEM", "0.90"))  # Increased default from 0.5 to 0.9
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "131072"))
-GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768"))
+GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 PYTHON = sys.executable
 
 TQ_ROTATION = os.environ.get("TQ_ROTATION", "dense")  # default to dense
