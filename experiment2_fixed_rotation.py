@@ -214,14 +214,16 @@ def main():
     parser.add_argument("--seeds", type=str, default="42,123,777,2024",
                         help="Comma-separated list of seeds for data/dense rotation (default: 42,123,777,2024)")
     parser.add_argument("--hadamard-seed", type=int, default=1337,
-                        help="Seed for Hadamard rotation (default: 1337)")
+                        help="Seed for Hadamard rotation (default: 1337) - deprecated, use --hadamard-seeds")
+    parser.add_argument("--hadamard-seeds", type=str, default="1337",
+                        help="Comma-separated list of seeds for Hadamard rotation (default: 1337)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show per-seed details")
     args = parser.parse_args()
     
-    # Parse seeds list
+    # Parse seeds lists
     seeds = [int(s.strip()) for s in args.seeds.split(",")]
-    hadamard_seed = args.hadamard_seed
+    hadamard_seeds = [int(s.strip()) for s in args.hadamard_seeds.split(",")]
     verbose = args.verbose
     
     print("=" * 60)
@@ -248,16 +250,42 @@ def main():
     # Run multi-seed robustness test
     all_results = []
     improvements = []
+    hadamard_seed_improvements = []
     
-    for seed in seeds:
-        result = run_single_seed(seed, hadamard_seed, d, n_samples, 
-                                 boundaries, centroids, verbose)
-        all_results.append(result)
-        improvements.append(result["improvement_pct"])
+    for hadamard_seed in hadamard_seeds:
+        seed_improvements = []
+        for seed in seeds:
+            result = run_single_seed(seed, hadamard_seed, d, n_samples, 
+                                     boundaries, centroids, verbose)
+            all_results.append(result)
+            seed_improvements.append(result["improvement_pct"])
+        
+        # Average improvement for this Hadamard seed across all data seeds
+        avg_imp = np.mean(seed_improvements)
+        hadamard_seed_improvements.append(avg_imp)
+        improvements.extend(seed_improvements)
+        
+        if len(hadamard_seeds) > 1 and verbose:
+            print(f"Hadamard seed {hadamard_seed}:   {avg_imp:+.2f}% improvement")
     
     # Compute summary statistics
     mean_imp = np.mean(improvements)
     std_imp = np.std(improvements)
+    
+    # Print Hadamard seed robustness check if multiple seeds tested
+    if len(hadamard_seeds) > 1:
+        print("\n" + "=" * 60)
+        print("HADAMARD SEED ROBUSTNESS CHECK")
+        print("=" * 60)
+        for hs, imp in zip(hadamard_seeds, hadamard_seed_improvements):
+            print(f"Hadamard seed {hs}:   {imp:+.2f}% improvement")
+        print("-" * 60)
+        hadamard_mean = np.mean(hadamard_seed_improvements)
+        hadamard_std = np.std(hadamard_seed_improvements)
+        print(f"Mean improvement:     {hadamard_mean:+.2f}%")
+        print(f"Std deviation:        ±{hadamard_std:.2f}%")
+        print(f"Range:                [{min(hadamard_seed_improvements):+.2f}%, {max(hadamard_seed_improvements):+.2f}%]")
+        print("=" * 60)
     
     # Print robustness summary
     print("\n" + "=" * 60)
@@ -273,13 +301,22 @@ def main():
         "single_seed_results": all_results[0] if len(all_results) == 1 else None,
         "multi_seed_results": {
             "seeds_tested": seeds,
-            "improvements": improvements,
+            "improvements": [np.mean(hadamard_seed_improvements)] if len(hadamard_seeds) == 1 else improvements,
             "mean_improvement_pct": float(mean_imp),
             "std_improvement_pct": float(std_imp),
-            "hadamard_seed_used": hadamard_seed,
+            "hadamard_seed_used": hadamard_seeds[0] if len(hadamard_seeds) == 1 else hadamard_seeds,
         },
         "all_results": all_results,
     }
+    
+    # Add Hadamard seed robustness section if multiple seeds tested
+    if len(hadamard_seeds) > 1:
+        output_results["hadamard_seed_robustness"] = {
+            "hadamard_seeds_tested": hadamard_seeds,
+            "improvements": [float(imp) for imp in hadamard_seed_improvements],
+            "mean_improvement_pct": float(np.mean(hadamard_seed_improvements)),
+            "std_improvement_pct": float(np.std(hadamard_seed_improvements)),
+        }
     
     results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
                                  "experiment2_fixed_results.json")
@@ -290,7 +327,10 @@ def main():
     
     # Final status line
     if mean_imp > 0:
-        print(f"\nSUCCESS: Hadamard rotation shows consistent improvement across seeds")
+        if len(hadamard_seeds) > 1:
+            print(f"\nSUCCESS: Hadamard advantage is consistent across seeds")
+        else:
+            print(f"\nSUCCESS: Hadamard rotation shows consistent improvement across seeds")
     else:
         print(f"\nFAILED: Check implementation")
 
