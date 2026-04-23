@@ -76,10 +76,7 @@
   "multi_seed_results": {
     "hadamard_seed_used": 1337,
     "improvements": [
-      23.264169530151367,
-      16.68693160381079,
-      20.302714520963573,
-      19.093786981209597
+      19.83690065903383
     ],
     "mean_improvement_pct": 19.83690065903383,
     "seeds_tested": [
