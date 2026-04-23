@@ -12,5 +12,13 @@
     "orth_error": 2.5033950805664062e-06
   },
   "improvement_pct": 6.482647190806209,
+  "outlier_aware": {
+    "correlation": 0.9980108737945557,
+    "d_prod": 3.97201074520126e-05,
+    "n_outliers": 30,
+    "n_regular": 354,
+    "outlier_ratio": 0.08,
+    "relative_rmse": 0.06306074006888547
+  },
   "variance_ratio": 19.18817105661955
 }
