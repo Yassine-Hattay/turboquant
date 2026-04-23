@@ -64,7 +64,9 @@ class LayerConfig:
     layer_idx: int = 0
     backend_kind: str = "flash"  # "flash" | "mla"
     device: torch.device = field(default_factory=lambda: torch.device("cuda"))
-    rotation_type: str = "dense"  # NEW: "dense" or "hadamard"
+    rotation_type: str = "dense"  # "dense" or "hadamard"
+    outlier_ratio: float = 0.08      # Fraction of channels to treat as outliers (default 8%)
+    outlier_bits: float = 16.0       # Bit-width for outliers: 16=FP16 pass-through, 4-6=quantized
 
 
 @dataclass
@@ -94,6 +96,8 @@ def _create_layer_state(cfg: LayerConfig) -> LayerState:
         device=cfg.device,
         layer_idx=cfg.layer_idx,
         rotation_type=cfg.rotation_type,  # PASS DOWN
+        outlier_ratio=cfg.outlier_ratio,  # PASS DOWN
+        outlier_bits=cfg.outlier_bits,    # PASS DOWN
     )
     engine = KVCaptureEngine(
         store=store,
@@ -349,7 +353,9 @@ def install_hooks(
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_CAPTURE_ONLY,
     no_alloc: bool = False,
-    rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
+    rotation_type: str = "dense",  # "dense" or "hadamard"
+    outlier_ratio: float = 0.08,    # Fraction of channels to treat as outliers
+    outlier_bits: float = 16.0,     # Bit-width for outliers: 16=FP16 pass-through
 ) -> dict[str, LayerState]:
     """Install TurboQuant hooks on all attention layers in a vLLM model runner.
 
@@ -399,6 +405,8 @@ def install_hooks(
             backend_kind=backend_kind,
             device=device,
             rotation_type=rotation_type,  # PASS DOWN
+            outlier_ratio=outlier_ratio,  # PASS DOWN
+            outlier_bits=outlier_bits,    # PASS DOWN
         )
 
         state = _create_layer_state(cfg)

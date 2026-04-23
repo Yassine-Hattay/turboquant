@@ -49,7 +49,9 @@ def install_turboquant_hooks(
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_ACCUMULATE,
     no_alloc: bool = False,
-    rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
+    rotation_type: str = "dense",  # "dense" or "hadamard"
+    outlier_ratio: float = 0.08,    # Fraction of channels to treat as outliers
+    outlier_bits: float = 16.0,     # Bit-width for outliers: 16=FP16 pass-through
 ):
     global _GLOBAL_MODE
     new_mode = _LEGACY_TO_NEW.get(mode, _new_backend.MODE_CAPTURE_ONLY)
@@ -65,6 +67,8 @@ def install_turboquant_hooks(
         mode=new_mode,
         no_alloc=no_alloc,
         rotation_type=rotation_type,  # PASS DOWN
+        outlier_ratio=outlier_ratio,  # PASS DOWN
+        outlier_bits=outlier_bits,    # PASS DOWN
     )
 
     _GLOBAL_MODE = mode

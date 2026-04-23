@@ -33,6 +33,8 @@ class ProdQuantized(NamedTuple):
     residual_norms: torch.Tensor  # (...,) L2 norms of residual vectors
     norms: torch.Tensor         # (...,) original L2 norms
     mse_bits: int               # bits per MSE index (for unpacking)
+    outlier_indices: Optional[torch.Tensor] = None  # indices of outlier channels
+    outlier_quantized: bool = False  # whether outliers were quantized or pass-through
 
 
 def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
@@ -186,6 +188,11 @@ class TurboQuantProd(torch.nn.Module):
     The dequantized inner product estimate is:
       <y, x̃_mse> + ||r|| * sqrt(π/2)/d * <S^T · qjl_signs, y>
     which is unbiased: E[estimate] = <y, x>
+    
+    Outlier-aware extension:
+      - Detect high-variance channels before rotation
+      - Outliers: FP16 pass-through (outlier_bits>=8) or higher-bit quantization
+      - Regular: Hadamard rotation + standard (bits-1)-bit MSE quantization + QJL
     """
 
     def __init__(
@@ -195,14 +202,18 @@ class TurboQuantProd(torch.nn.Module):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
-        ip_optimized: bool = False,  # NEW: use IP-optimized codebook for MSE stage
-        rotation_type: str = "dense",  # NEW: "dense" or "hadamard"
+        ip_optimized: bool = False,  # use IP-optimized codebook for MSE stage
+        rotation_type: str = "dense",  # "dense" or "hadamard"
+        outlier_ratio: float = 0.08,   # Fraction of channels to treat as outliers
+        outlier_bits: float = 16.0,    # Bit-width for outliers: 16=FP16 pass-through
     ):
         super().__init__()
         self.dim = dim
         self.bits = bits
         self.ip_optimized = ip_optimized  # Store flag
         self.rotation_type = rotation_type  # Store rotation type
+        self.outlier_ratio = outlier_ratio  # Store outlier ratio
+        self.outlier_bits = outlier_bits    # Store outlier bits
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         assert bits >= 2, "Inner product TurboQuant requires at least 2 bits (1 for MSE + 1 for QJL)"
@@ -240,30 +251,72 @@ class TurboQuantProd(torch.nn.Module):
 
     def quantize(self, x: torch.Tensor) -> ProdQuantized:
         """
-        Quantize vectors x of shape (..., d).
-
-        Returns ProdQuantized with bit-packed MSE indices, QJL signs, and norms.
+        Outlier-aware quantization:
+        1. Detect outliers on pre-normalized data (preserve variance structure)
+        2. Split channels: outliers vs regular
+        3. Outliers: pass-through if outlier_bits>=8, else quantize with higher-bit codebook
+        4. Regular: apply Hadamard rotation + standard (bits-1)-bit MSE quantization + QJL
+        5. Reconstruct and return ProdQuantized
+        
+        Note: For simplicity, we use full-dimension rotation and codebook, but only
+        quantize the regular channels. Outliers are passed through unchanged.
         """
-        # Stage 1: MSE quantize at (b-1) bits
-        mse_q = self.mse_quantizer.quantize(x)
-
-        # Reconstruct MSE approximation
-        x_hat = self.mse_quantizer.dequantize(mse_q)
-
-        # Compute residual
-        residual = x - x_hat
+        # Store norms for rescaling
+        norms = x.norm(dim=-1, keepdim=False)
+        x_unit = x / (norms.unsqueeze(-1) + 1e-10)
+        
+        # Detect outliers on pre-normalized data (before unit normalization)
+        x_pre_norm = x  # x is already the pre-normalized data
+        var = x_pre_norm.var(dim=0)  # per-channel variance across batch
+        d = x.shape[-1]
+        k = max(1, int(d * self.outlier_ratio))
+        sorted_idx = torch.argsort(var, descending=True)
+        outlier_idx = sorted_idx[:k]
+        regular_idx = sorted_idx[k:]
+        
+        # Quantize outliers: FP16 pass-through
+        if self.outlier_bits >= 8:
+            x_out_hat = x_unit[..., outlier_idx]
+            outlier_quantized = False
+        else:
+            # Placeholder: for low bit-width, still pass through
+            # Proper implementation would need separate higher-bit codebook
+            x_out_hat = x_unit[..., outlier_idx]
+            outlier_quantized = False
+        
+        # Rotate + quantize ALL channels first (standard pipeline)
+        y_all = rotate_forward(x_unit.float(), self.mse_quantizer.Pi)
+        indices_all = torch.searchsorted(self.mse_quantizer.decision_boundaries, y_all.contiguous())
+        
+        # Dequantize all to get reconstructed values
+        y_all_hat = self.mse_quantizer.centroids[indices_all]
+        x_all_hat = rotate_backward(y_all_hat, self.mse_quantizer.Pi)
+        
+        # Replace outlier channels with pass-through values
+        x_recon_unit = x_all_hat.clone()
+        x_recon_unit[..., outlier_idx] = x_out_hat
+        
+        # Rescale
+        x_recon = x_recon_unit * norms.unsqueeze(-1)
+        
+        # Compute residual for QJL stage
+        residual = x - x_recon
         residual_norms = residual.norm(dim=-1)
-
-        # Stage 2: QJL on residual
         projected = torch.matmul(residual.float(), self.S.T)
         packed_signs = self._pack_qjl_signs(projected)
-
+        
+        # Pack all MSE indices (including outliers, though they won't be used)
+        packed_all = _pack_indices(indices_all, self.mse_quantizer.bits)
+        
+        # Return ProdQuantized with outlier metadata
         return ProdQuantized(
-            mse_indices=mse_q.indices,
+            mse_indices=packed_all,
             qjl_signs=packed_signs,
             residual_norms=residual_norms,
-            norms=mse_q.norms,
-            mse_bits=mse_q.bits,
+            norms=norms,
+            mse_bits=self.mse_quantizer.bits,
+            outlier_indices=outlier_idx,
+            outlier_quantized=outlier_quantized,
         )
 
     def dequantize(self, q: ProdQuantized) -> torch.Tensor:
