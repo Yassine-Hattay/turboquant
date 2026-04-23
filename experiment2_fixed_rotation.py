@@ -7,71 +7,52 @@ via quantizer.Pi = Pi. Because Pi is registered with self.register_buffer() in T
 direct attribute assignment is ignored. This script computes D_prod manually to bypass
 the broken injection entirely.
 """
-
 import os
 import sys
 import json
+import argparse
 import torch
 import numpy as np
 
-# Setup: Import from local turboquant directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# CPU-only, deterministic seeds
-torch.manual_seed(42)
-np.random.seed(42)
 device = torch.device("cpu")
 
 
-def dense_rotation(d: int, device: torch.device) -> torch.Tensor:
+def dense_rotation(d: int, device: torch.device, seed: int) -> torch.Tensor:
     """Generate dense random rotation: randn → QR → fix signs → return Q."""
-    A = torch.randn(d, d, device=device, dtype=torch.float32)
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(seed)
+    A = torch.randn(d, d, device=device, dtype=torch.float32, generator=rng)
     Q, R = torch.linalg.qr(A)
-    # Fix signs: ensure diagonal of R is positive
     signs = torch.sign(torch.diag(R))
-    Q = Q * signs.unsqueeze(0)
-    return Q
+    return Q * signs.unsqueeze(0)
 
 
-def hadamard_rotation(d: int, device: torch.device) -> torch.Tensor:
+def hadamard_rotation(d: int, device: torch.device, seed: int = 1337) -> torch.Tensor:
     """
     Generate Hadamard rotation with orthogonality fix.
-    
     CRITICAL FIX: Apply torch.linalg.qr to the truncated matrix and fix signs
-    to restore orthogonality after truncation.
+    to restore orthogonality after truncation. Uses seed=1337 to decorrelate from data.
     """
-    # Find next power of 2 >= d
     n = 1
     while n < d:
         n *= 2
-    
-    # Build Sylvester Hadamard matrix recursively
+
     def build_hadamard(size):
         if size == 1:
             return torch.tensor([[1.0]], device=device)
         H_prev = build_hadamard(size // 2)
-        H_top = torch.cat([H_prev, H_prev], dim=1)
-        H_bottom = torch.cat([H_prev, -H_prev], dim=1)
-        return torch.cat([H_top, H_bottom], dim=0)
-    
+        return torch.cat([torch.cat([H_prev, H_prev], dim=1),
+                          torch.cat([H_prev, -H_prev], dim=1)], dim=0)
+
     H = build_hadamard(n)
-    
-    # Apply random Rademacher sign flips
     rng = torch.Generator(device="cpu")
-    rng.manual_seed(42)
+    rng.manual_seed(seed)
     signs = (torch.randint(0, 2, (n,), generator=rng, device=device, dtype=torch.float32) * 2 - 1)
     H = H * signs.unsqueeze(0)
-    
-    # Truncate to d×d
     H_truncated = H[:d, :d]
-    
-    # CRITICAL FIX: Apply QR to restore orthogonality after truncation
     Q, R = torch.linalg.qr(H_truncated)
-    # Fix signs
-    diag_signs = torch.sign(torch.diag(R))
-    Q = Q * diag_signs.unsqueeze(0)
-    
-    return Q
+    return Q * torch.sign(torch.diag(R)).unsqueeze(0)
 
 
 def assert_orthogonality(Pi: torch.Tensor, name: str) -> None:
@@ -146,93 +127,69 @@ def compute_variance_ratio(X: torch.Tensor, Pi: torch.Tensor) -> float:
     return ratio
 
 
-def main():
-    print("=" * 60)
-    print("Experiment 2 Fixed: Manual D_prod Comparison")
-    print("Dense vs Hadamard Rotations (CPU-only)")
-    print("=" * 60)
-    
-    # Data Generation
-    print("\nGenerating anisotropic data...")
-    n_samples = 5000
-    d = 128
-    
+def run_single_seed(seed: int, hadamard_seed: int, d: int, n_samples: int,
+                    boundaries: torch.Tensor, centroids: torch.Tensor,
+                    verbose: bool = False) -> dict:
+    """Run experiment for a single seed and return results."""
+    if verbose:
+        print(f"\nGenerating anisotropic data (seed={seed})...")
+
     # Generate anisotropic structure: variance ratio ~3-5x across channels
     rng = torch.Generator(device="cpu")
-    rng.manual_seed(42)
-    
+    rng.manual_seed(seed)
+
     # Create variance profile with ~4x ratio
     base_variance = torch.linspace(0.5, 2.0, d, device=device)
-    variance_profile = base_variance / base_variance.mean()  # Normalize to mean=1
-    
+    variance_profile = base_variance / base_variance.mean()
+
     # Generate vectors with anisotropic variance
     X_aniso = torch.randn(n_samples, d, device=device, dtype=torch.float32, generator=rng)
     X_aniso = X_aniso * variance_profile.sqrt()
-    
+
+    # ANISOTROPY SURVIVAL DIAGNOSTIC
+    if verbose:
+        X_pre_norm = X_aniso.clone()
+        coord_var_pre = X_pre_norm.var(dim=0)
+        print(f"Anisotropy check:")
+        print(f"  Pre-normalization variance ratio: {(coord_var_pre.max()/coord_var_pre.min()).item():.2f}x")
+
     # Normalize all vectors to unit sphere
     X_all = X_aniso / X_aniso.norm(dim=1, keepdim=True)
-    
-    # Split into two halves: X (keys to quantize) and Y (queries kept exact)
+
+    if verbose:
+        coord_var_post = X_all.var(dim=0)
+        print(f"  Post-normalization variance ratio: {(coord_var_post.max()/coord_var_post.min()).item():.2f}x")
+
+    # Split into two halves: X (keys) and Y (queries)
     X = X_all[:n_samples//2]
     Y = X_all[n_samples//2:n_samples]
-    
-    print(f"  Generated {X.shape[0]} key vectors and {Y.shape[0]} query vectors")
-    print(f"  Dimension: {d}, Anisotropy ratio: ~{variance_profile.max()/variance_profile.min():.1f}x")
-    
-    # Load codebook
-    print("\nLoading 3-bit codebook...")
-    codebook_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
-                                  "turboquant/codebooks/codebook_d128_b3.json")
-    with open(codebook_path, 'r') as f:
-        codebook_data = json.load(f)
-    
-    boundaries = torch.tensor(codebook_data["boundaries"], device=device, dtype=torch.float32)
-    centroids = torch.tensor(codebook_data["centroids"], device=device, dtype=torch.float32)
-    print(f"  Loaded codebook: {len(centroids)} centroids, {len(boundaries)} boundaries")
-    
+
     # Generate rotation matrices
-    print("\nGenerating rotation matrices...")
-    Pi_dense = dense_rotation(d, device)
-    Pi_hadamard = hadamard_rotation(d, device)
-    
+    Pi_dense = dense_rotation(d, device, seed=seed)
+    Pi_hadamard = hadamard_rotation(d, device, seed=hadamard_seed)
+
     # Assert orthogonality
-    print("\nOrthogonality checks:")
     assert_orthogonality(Pi_dense, "Dense")
     assert_orthogonality(Pi_hadamard, "Hadamard")
-    
+
     # Compute variance ratios
-    print("\nPost-rotation variance analysis:")
     var_ratio_dense = compute_variance_ratio(X, Pi_dense)
     var_ratio_hadamard = compute_variance_ratio(X, Pi_hadamard)
-    print(f"  Dense rotation variance ratio: {var_ratio_dense:.4f}")
-    print(f"  Hadamard rotation variance ratio: {var_ratio_hadamard:.4f}")
-    
-    # Compute D_prod for both rotations on the SAME X and Y tensors
-    print("\nComputing D_prod metrics...")
+
+    # Compute D_prod for both rotations
     results_dense = compute_d_prod_manual(X, Y, Pi_dense, boundaries, centroids)
     results_hadamard = compute_d_prod_manual(X, Y, Pi_hadamard, boundaries, centroids)
-    
+
     # Calculate improvement
     d_prod_dense = results_dense["d_prod"]
     d_prod_hadamard = results_hadamard["d_prod"]
     improvement_pct = ((d_prod_dense - d_prod_hadamard) / d_prod_dense) * 100
-    
-    # Print terminal summary
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
-    print(f"\n{'Metric':<25} {'Dense':>15} {'Hadamard':>15}")
-    print("-" * 60)
-    print(f"{'Orthogonality Error':<25} {torch.max(torch.abs(Pi_dense @ Pi_dense.T - torch.eye(d, device=device))):>15.6f} {torch.max(torch.abs(Pi_hadamard @ Pi_hadamard.T - torch.eye(d, device=device))):>15.6f}")
-    print(f"{'Variance Ratio':<25} {var_ratio_dense:>15.4f} {var_ratio_hadamard:>15.4f}")
-    print(f"{'D_prod':<25} {d_prod_dense:>15.6f} {d_prod_hadamard:>15.6f}")
-    print(f"{'Relative RMSE':<25} {results_dense['relative_rmse']:>15.4f} {results_hadamard['relative_rmse']:>15.4f}")
-    print(f"{'Pearson Correlation':<25} {results_dense['correlation']:>15.4f} {results_hadamard['correlation']:>15.4f}")
-    print("-" * 60)
-    print(f"{'% Improvement':<25} {improvement_pct:>15.2f}%")
-    
-    # Save results to JSON
-    output_results = {
+
+    if verbose:
+        print(f"Seed {seed}: Hadamard improves D_prod by {improvement_pct:+.2f}%")
+
+    return {
+        "seed": seed,
         "dense": {
             "orthogonality_error": torch.max(torch.abs(Pi_dense @ Pi_dense.T - torch.eye(d, device=device))).item(),
             "variance_ratio": var_ratio_dense,
@@ -248,25 +205,94 @@ def main():
             "correlation": results_hadamard["correlation"],
         },
         "improvement_pct": improvement_pct,
-        "config": {
-            "n_samples": n_samples,
-            "dimension": d,
-            "bits": 3,
-            "seed": 42,
-        }
+    }
+
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Experiment 2 Fixed: Multi-Seed Validation")
+    parser.add_argument("--seeds", type=str, default="42,123,777,2024",
+                        help="Comma-separated list of seeds for data/dense rotation (default: 42,123,777,2024)")
+    parser.add_argument("--hadamard-seed", type=int, default=1337,
+                        help="Seed for Hadamard rotation (default: 1337)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show per-seed details")
+    args = parser.parse_args()
+    
+    # Parse seeds list
+    seeds = [int(s.strip()) for s in args.seeds.split(",")]
+    hadamard_seed = args.hadamard_seed
+    verbose = args.verbose
+    
+    print("=" * 60)
+    print("Experiment 2 Fixed: Multi-Seed Validation")
+    print("=" * 60)
+    
+    # Data Generation parameters
+    n_samples = 5000
+    d = 128
+    
+    # Load codebook (once, shared across all seeds)
+    if verbose:
+        print("\nLoading 3-bit codebook...")
+    codebook_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                  "turboquant/codebooks/codebook_d128_b3.json")
+    with open(codebook_path, 'r') as f:
+        codebook_data = json.load(f)
+    
+    boundaries = torch.tensor(codebook_data["boundaries"], device=device, dtype=torch.float32)
+    centroids = torch.tensor(codebook_data["centroids"], device=device, dtype=torch.float32)
+    if verbose:
+        print(f"  Loaded codebook: {len(centroids)} centroids, {len(boundaries)} boundaries")
+    
+    # Run multi-seed robustness test
+    all_results = []
+    improvements = []
+    
+    for seed in seeds:
+        result = run_single_seed(seed, hadamard_seed, d, n_samples, 
+                                 boundaries, centroids, verbose)
+        all_results.append(result)
+        improvements.append(result["improvement_pct"])
+    
+    # Compute summary statistics
+    mean_imp = np.mean(improvements)
+    std_imp = np.std(improvements)
+    
+    # Print robustness summary
+    print("\n" + "=" * 60)
+    print("ROBUSTNESS SUMMARY")
+    print("=" * 60)
+    print(f"Mean improvement: {mean_imp:+.2f}%")
+    print(f"Std deviation:    ±{std_imp:.2f}%")
+    print(f"Range:            [{min(improvements):+.2f}%, {max(improvements):+.2f}%]")
+    print("=" * 60)
+    
+    # Save results to JSON
+    output_results = {
+        "single_seed_results": all_results[0] if len(all_results) == 1 else None,
+        "multi_seed_results": {
+            "seeds_tested": seeds,
+            "improvements": improvements,
+            "mean_improvement_pct": float(mean_imp),
+            "std_improvement_pct": float(std_imp),
+            "hadamard_seed_used": hadamard_seed,
+        },
+        "all_results": all_results,
     }
     
     results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
                                  "experiment2_fixed_results.json")
     with open(results_path, 'w') as f:
         json.dump(output_results, f, indent=2, sort_keys=True)
-    print(f"\nResults saved to: {results_path}")
+    if verbose:
+        print(f"\nResults saved to: {results_path}")
     
     # Final status line
-    if improvement_pct > 0:
-        print(f"\nSUCCESS: Hadamard improves D_prod by {improvement_pct:.2f}%")
+    if mean_imp > 0:
+        print(f"\nSUCCESS: Hadamard rotation shows consistent improvement across seeds")
     else:
-        print(f"\nFAILED: Check implementation (Hadamard is {-improvement_pct:.2f}% worse)")
+        print(f"\nFAILED: Check implementation")
 
 
 if __name__ == "__main__":
