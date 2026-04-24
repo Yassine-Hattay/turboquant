@@ -102,72 +102,61 @@ if __name__ == "__main__":
     main()
 '''
 
-TQ = f'''
+def _get_tq_script(rotation_type: str, outlier_ratio: float, outlier_bits: float):
+    return f'''
 import os, json, subprocess, time
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
 def main():
     import sys
     from vllm import LLM, SamplingParams
-    
     print("[TQ] Starting...", flush=True)
-    print(f"[TQ] Loading model: {{{{MODEL}}}}", flush=True)
-
+    print(f"[TQ] Loading model: {{MODEL}}", flush=True)
     llm = LLM(
         model="{MODEL}", dtype="bfloat16",
         gpu_memory_utilization={GPU_MEM},
         max_model_len={MAX_MODEL_LEN},
         tensor_parallel_size={TP},
         trust_remote_code=True, max_num_seqs=1,
-        enforce_eager=True,  # Add this to reduce compilation overhead
+        enforce_eager=True,
     )
     print("[TQ] Model loaded", flush=True)
-    
     blocks = llm.llm_engine.vllm_config.cache_config.num_gpu_blocks
     print(f"[TQ] Allocated {{blocks}} KV blocks", flush=True)
-
     engine = llm.llm_engine
     core = getattr(engine, "engine_core", engine)
     inner = getattr(core, "engine_core", core)
     executor = inner.model_executor
-
     print("[TQ] Installing TurboQuant hooks...", flush=True)
     def _install(worker):
         from turboquant.vllm_attn_backend import install_turboquant_hooks, MODE_ACTIVE
         return len(install_turboquant_hooks(worker.model_runner, key_bits=3, value_bits=2,
-            buffer_size=128, mode=MODE_ACTIVE, rotation_type="{TQ_ROTATION}",
-            outlier_ratio={TQ_OUTLIER_RATIO}, outlier_bits={TQ_OUTLIER_BITS}))
+        buffer_size=128, mode=MODE_ACTIVE, rotation_type="{rotation_type}",
+        outlier_ratio={outlier_ratio}, outlier_bits={outlier_bits}))
     hooks = executor.collective_rpc(_install)
     print(f"[TQ] Hooks installed on {{hooks[0]}} layers", flush=True)
-
     print("[TQ] Generating...", flush=True)
     t0 = time.perf_counter()
     out = llm.generate(["Explain KV cache compression in LLM inference."],
-        SamplingParams(temperature=0, max_tokens=64))
+    SamplingParams(temperature=0, max_tokens=64))
     t1 = time.perf_counter()
     print(f"[TQ] Generation took {{t1-t0:.2f}}s", flush=True)
-
     r = subprocess.run(["nvidia-smi","--query-gpu=index,memory.used","--format=csv,noheader,nounits"],
-        capture_output=True, text=True)
+    capture_output=True, text=True)
     vram_gen = [int(l.split(",")[1].strip()) for l in r.stdout.strip().split("\\n") if l.strip()]
-
     print("[TQ] Freeing KV cache...", flush=True)
     def _free(worker):
         from turboquant.vllm_attn_backend import free_kv_cache
         return free_kv_cache(worker.model_runner)
     freed = executor.collective_rpc(_free)
     print(f"[TQ] Freed {{sum(freed)/1e6:.0f}} MB total", flush=True)
-
     r2 = subprocess.run(["nvidia-smi","--query-gpu=index,memory.used","--format=csv,noheader,nounits"],
-        capture_output=True, text=True)
+    capture_output=True, text=True)
     vram_freed = [int(l.split(",")[1].strip()) for l in r2.stdout.strip().split("\\n") if l.strip()]
-
     print(json.dumps({{"blocks": blocks, "hooks": hooks[0], "vram_gen": vram_gen,
-        "vram_freed": vram_freed, "freed_bytes": freed,
-        "text": out[0].outputs[0].text[:100], "rotation_type": "{TQ_ROTATION}",
-        "elapsed": round(t1-t0, 2)}}))
-
+    "vram_freed": vram_freed, "freed_bytes": freed,
+    "text": out[0].outputs[0].text[:100], "rotation_type": "{rotation_type}",
+    "elapsed": round(t1-t0, 2)}}))
 if __name__ == "__main__":
     main()
 '''
@@ -199,7 +188,7 @@ def main():
     print(f">>> Baseline complete. Blocks: {bl.get('blocks', 'N/A')}", flush=True)
 
     print(">>> Phase 2: TurboQuant ...", flush=True)
-    tq = run_phase("tq", TQ)
+    tq = run_phase("tq", _get_tq_script(TQ_ROTATION, TQ_OUTLIER_RATIO, TQ_OUTLIER_BITS))
     if not tq:
         print(">>> TurboQuant phase failed. Check stderr above.", flush=True)
         return

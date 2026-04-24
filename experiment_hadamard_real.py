@@ -53,9 +53,9 @@ def run_outlier_aware_single_seed(
     X = X_all[:n_samples//2]
     Y = X_all[n_samples//2:]
     
-    # Detect outliers on pre-normalized data (preserve variance structure)
-    X_pre_norm = vectors_shuffled[:n_samples//2]  # before unit normalization
-    var = torch.tensor(np.var(X_pre_norm, axis=0), device=device)
+    # FIX: Detect outliers from held-out Y split to prevent data leakage
+    Y_pre_norm = vectors_shuffled[n_samples//2:]
+    var = torch.tensor(np.var(Y_pre_norm, axis=0), device=device)
     sorted_idx = torch.argsort(var, descending=True)
     k = max(1, int(d * outlier_ratio))
     outlier_idx = sorted_idx[:k]
