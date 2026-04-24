@@ -10,9 +10,9 @@ Design rules:
 from __future__ import annotations
 
 import torch
-from typing import Optional, NamedTuple
+from typing import Optional, NamedTuple, Union
 
-from turboquant.quantizer import TurboQuantProd, ProdQuantized
+from turboquant.quantizer import TurboQuantProd, ProdQuantized, HybridQuantized
 from turboquant.kv_cache import quantize_values, ValueQuantized
 
 
@@ -55,17 +55,29 @@ class CompressedKVStore:
         self.outlier_ratio = outlier_ratio  # Store outlier ratio
         self.outlier_bits = outlier_bits    # Store outlier bits
 
-        self.quantizer = TurboQuantProd(
-            dim=head_dim,
-            bits=key_bits,
-            device=self.device,
-            seed=42 + layer_idx * 7,
-            rotation_type=rotation_type,  # PASS DOWN
-            outlier_ratio=outlier_ratio,  # PASS DOWN
-            outlier_bits=outlier_bits,    # PASS DOWN
-        )
+        # Choose quantizer based on outlier_ratio
+        if outlier_ratio > 0.0:
+            from turboquant.quantizer import TurboQuantHybrid
+            self.quantizer = TurboQuantHybrid(
+                dim=head_dim,
+                bits=key_bits,
+                outlier_ratio=outlier_ratio,
+                device=self.device,
+                seed=42 + layer_idx * 7,
+                warmup_tokens=256,
+            )
+            self._use_hybrid = True
+        else:
+            self.quantizer = TurboQuantProd(
+                dim=head_dim,
+                bits=key_bits,
+                device=self.device,
+                seed=42 + layer_idx * 7,
+                rotation_type=rotation_type,
+            )
+            self._use_hybrid = False
 
-        self._key_chunks: list[ProdQuantized] = []
+        self._key_chunks: list = []  # Can hold either ProdQuantized or HybridQuantized
         self._value_chunks: list[ValueQuantized] = []
         self._chunk_lengths: list[int] = []
 
@@ -90,6 +102,15 @@ class CompressedKVStore:
         k = key.transpose(0, 1).unsqueeze(0)  # (1, H, T, D)
         v = value.transpose(0, 1).unsqueeze(0)
 
+        # For hybrid mode, feed data to detector during warmup
+        if self._use_hybrid:
+            if not self.quantizer.is_ready:
+                self.quantizer.update_detector(k)
+                # If still not ready after update (need more warmup), skip this chunk
+                # This shouldn't happen in normal flow since capture.py handles warmup first
+                if not self.quantizer.is_ready:
+                    return  # Skip until detector is ready
+        
         key_q = self.quantizer.quantize(k)
         val_q = quantize_values(v, bits=self.value_bits, group_size=self.value_group_size)
 
@@ -143,16 +164,23 @@ class CompressedKVStore:
         self._flat = None
 
 
-def _flatten_prod_q(pq: ProdQuantized) -> ProdQuantized:
+def _flatten_prod_q(pq) -> Union[ProdQuantized, HybridQuantized]:
     """Collapse batch dim: (1, H, T, ...) -> (H, T, ...)."""
+    if isinstance(pq, HybridQuantized):
+        return HybridQuantized(
+            regular_q=_flatten_prod_q(pq.regular_q),
+            outlier_data=pq.outlier_data.reshape(-1, *pq.outlier_data.shape[-2:]).contiguous(),
+            regular_idx=pq.regular_idx,
+            outlier_idx=pq.outlier_idx,
+            d_total=pq.d_total,
+        )
+    # Original ProdQuantized handling
     return ProdQuantized(
         mse_indices=pq.mse_indices.reshape(-1, pq.mse_indices.shape[-2], pq.mse_indices.shape[-1]).contiguous(),
         qjl_signs=pq.qjl_signs.reshape(-1, pq.qjl_signs.shape[-2], pq.qjl_signs.shape[-1]).contiguous(),
         residual_norms=pq.residual_norms.reshape(-1, pq.residual_norms.shape[-1]).contiguous(),
         norms=pq.norms.reshape(-1, pq.norms.shape[-1]).contiguous(),
         mse_bits=pq.mse_bits,
-        outlier_indices=pq.outlier_indices,  # Preserve outlier indices
-        outlier_quantized=pq.outlier_quantized,  # Preserve flag
     )
 
 
@@ -167,16 +195,23 @@ def _flatten_value_q(vq: ValueQuantized) -> ValueQuantized:
     )
 
 
-def _concat_prod_q(chunks: list[ProdQuantized]) -> ProdQuantized:
-    """Concatenate multiple flattened ProdQuantized along the token dimension."""
+def _concat_prod_q(chunks: list) -> Union[ProdQuantized, HybridQuantized]:
+    """Concatenate multiple flattened quantized outputs along the token dimension."""
+    if isinstance(chunks[0], HybridQuantized):
+        return HybridQuantized(
+            regular_q=_concat_prod_q([c.regular_q for c in chunks]),
+            outlier_data=torch.cat([c.outlier_data for c in chunks], dim=-2),
+            regular_idx=chunks[0].regular_idx,
+            outlier_idx=chunks[0].outlier_idx,
+            d_total=chunks[0].d_total,
+        )
+    # Original ProdQuantized handling
     return ProdQuantized(
         mse_indices=torch.cat([c.mse_indices for c in chunks], dim=-2),
         qjl_signs=torch.cat([c.qjl_signs for c in chunks], dim=-2),
         residual_norms=torch.cat([c.residual_norms for c in chunks], dim=-1),
         norms=torch.cat([c.norms for c in chunks], dim=-1),
         mse_bits=chunks[0].mse_bits,
-        outlier_indices=chunks[0].outlier_indices,  # Same for all chunks
-        outlier_quantized=chunks[0].outlier_quantized,  # Same for all chunks
     )
 
 

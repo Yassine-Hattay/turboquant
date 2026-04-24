@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from turboquant.store import FlatCache, CompressedKVStore
 from turboquant.kv_cache import dequantize_values
-from turboquant.quantizer import TurboQuantProd
+from turboquant.quantizer import TurboQuantProd, HybridQuantized
 
 logger = logging.getLogger("turboquant.score")
 
@@ -84,16 +84,39 @@ def compute_hybrid_attention(
 def _attend_compressed_only(
     query: torch.Tensor,
     flat: FlatCache,
-    quantizer: TurboQuantProd,
+    quantizer,  # Can be TurboQuantProd or TurboQuantHybrid
     gqa_ratio: int,
     num_kv_heads: int,
     scale: float,
 ) -> torch.Tensor:
     """Attention over compressed history only (PyTorch path)."""
-    k_dequant = quantizer.dequantize(flat.prod_q)  # (H_kv, N, D)
-    v_dequant = dequantize_values(flat.value_q, 32)
-
-    return _matmul_attend(query, k_dequant, v_dequant, gqa_ratio, num_kv_heads, scale)
+    from turboquant.quantizer import HybridQuantized
+    
+    if isinstance(flat.prod_q, HybridQuantized):
+        # Hybrid path: use quantizer's attention_score method which handles the split
+        # attention_score returns (T, Q, N) but we need to apply softmax per-query-head
+        scores = quantizer.attention_score(query, flat.prod_q)  # (T, Q, N_hist)
+        v_dequant = dequantize_values(flat.value_q, 32)  # (H_kv, N_hist, D)
+        
+        # Apply softmax and compute output with GQA
+        # scores: (T, Q, N_hist), v_dequant: (H_kv, N_hist, D)
+        # Need to expand v_dequant to match Q heads
+        T, Q, N_hist = scores.shape
+        D = v_dequant.shape[-1]
+        
+        # Reshape scores to (T, H_kv, G, N_hist)
+        scores_gqa = scores.view(T, num_kv_heads, gqa_ratio, N_hist)
+        weights_gqa = F.softmax(scores_gqa * scale, dim=-1)  # (T, H_kv, G, N_hist)
+        
+        # Compute output: sum over N_hist
+        # out: (T, H_kv, G, D) = weights[T,H_kv,G,N] @ v[H_kv,N,D]
+        out = torch.einsum("thgn,hnd->thgd", weights_gqa, v_dequant.float())
+        return out.reshape(T, Q, D).to(query.dtype)
+    else:
+        # Original path unchanged
+        k_dequant = quantizer.dequantize(flat.prod_q)
+        v_dequant = dequantize_values(flat.value_q, 32)
+        return _matmul_attend(query, k_dequant, v_dequant, gqa_ratio, num_kv_heads, scale)
 
 
 def _attend_exact_only(
@@ -114,7 +137,7 @@ def _attend_exact_only(
 def _attend_hybrid(
     query: torch.Tensor,
     flat: FlatCache,
-    quantizer: TurboQuantProd,
+    quantizer,  # Can be TurboQuantProd or TurboQuantHybrid
     recent_k: torch.Tensor,
     recent_v: torch.Tensor,
     gqa_ratio: int,
@@ -123,16 +146,56 @@ def _attend_hybrid(
     scale: float,
 ) -> torch.Tensor:
     """Merge compressed history + exact recent via concatenated attention."""
-    k_hist = quantizer.dequantize(flat.prod_q)  # (H_kv, N_hist, D)
-    v_hist = dequantize_values(flat.value_q, 32)
+    from turboquant.quantizer import HybridQuantized
+    
+    if isinstance(flat.prod_q, HybridQuantized):
+        # Hybrid path: use quantizer's attention_score for history
+        scores_hist = quantizer.attention_score(query, flat.prod_q)
+        v_hist = dequantize_values(flat.value_q, 32)
+        
+        # Recent keys/values are already in exact form
+        k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
+        v_recent = recent_v.transpose(0, 1)
+        
+        # Compute scores for recent part
+        # query: (T, Q, D) = (T, H_kv * gqa_ratio, D)
+        # k_recent: (H_kv, N_recent, D)
+        # Need to compute per-group scores: (T, H_kv, gqa_ratio, N_recent)
+        T = query.shape[0]
+        q_for_recent = query.float().view(T, num_kv_heads, gqa_ratio, head_dim)  # (T, H_kv, G, D)
+        # k_recent_float: (H_kv, N_recent, D)
+        k_recent_float = k_recent.float()
+        # scores: (T, H_kv, G, N_recent) = <q[T,H_kv,G,D], k[H_kv,N_recent,D]>
+        scores_recent = torch.einsum("thgd,hnd->thgn", q_for_recent, k_recent_float) * scale
+        
+        # scores_hist: (T, H_kv, N_hist) -> expand to (T, H_kv, G, N_hist)
+        scores_hist_expanded = scores_hist.unsqueeze(2).expand(-1, -1, gqa_ratio, -1)
+        
+        # Concatenate scores and apply softmax
+        scores_all = torch.cat([scores_hist_expanded, scores_recent], dim=-1)
+        weights_all = F.softmax(scores_all, dim=-1)
+        
+        # Split weights and compute output
+        n_hist = scores_hist.shape[-1]
+        weights_hist = weights_all[:, :, :, :n_hist].reshape(T, num_kv_heads * gqa_ratio, -1)
+        weights_recent = weights_all[:, :, :, n_hist:].reshape(T, num_kv_heads * gqa_ratio, -1)
+        
+        out_hist = torch.matmul(weights_hist, v_hist.float())
+        out_recent = torch.matmul(weights_recent, v_recent.float())
+        
+        return (out_hist + out_recent).to(query.dtype)
+    else:
+        # Original path unchanged
+        k_hist = quantizer.dequantize(flat.prod_q)  # (H_kv, N_hist, D)
+        v_hist = dequantize_values(flat.value_q, 32)
 
-    k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
-    v_recent = recent_v.transpose(0, 1)
+        k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
+        v_recent = recent_v.transpose(0, 1)
 
-    k_all = torch.cat([k_hist.float(), k_recent.float()], dim=1)
-    v_all = torch.cat([v_hist.float(), v_recent.float()], dim=1)
+        k_all = torch.cat([k_hist.float(), k_recent.float()], dim=1)
+        v_all = torch.cat([v_hist.float(), v_recent.float()], dim=1)
 
-    return _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
+        return _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
 
 
 def _matmul_attend(

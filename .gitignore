@@ -1,19 +1,4 @@
 ```
-# Compiled Python files
-*.pyc
 __pycache__/
-
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Environment files
-.env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
+*.pyc
 ```
