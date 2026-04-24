@@ -111,7 +111,7 @@ def main():
     import sys
     from vllm import LLM, SamplingParams
     print("[TQ] Starting...", flush=True)
-    print(f"[TQ] Loading model: {{MODEL}}", flush=True)
+    print(f"[TQ] Loading model: {MODEL}", flush=True)
     llm = LLM(
         model="{MODEL}", dtype="bfloat16",
         gpu_memory_utilization={GPU_MEM},
