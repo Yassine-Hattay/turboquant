@@ -27,14 +27,30 @@ class MSEQuantized(NamedTuple):
 
 
 class ProdQuantized(NamedTuple):
-    """Output of TurboQuant inner-product quantization."""
-    mse_indices: torch.Tensor   # (..., packed_len) uint8 bit-packed MSE indices
-    qjl_signs: torch.Tensor    # (..., packed_len) uint8 packed sign bits
-    residual_norms: torch.Tensor  # (...,) L2 norms of residual vectors
-    norms: torch.Tensor         # (...,) original L2 norms
-    mse_bits: int               # bits per MSE index (for unpacking)
-    outlier_indices: Optional[torch.Tensor] = None  # indices of outlier channels
-    outlier_quantized: bool = False  # whether outliers were quantized or pass-through
+    """Output of TurboQuant inner-product quantization (regular channels only)."""
+    mse_indices: torch.Tensor      # (..., packed_len) uint8 bit-packed MSE indices
+    qjl_signs: torch.Tensor        # (..., packed_len) uint8 packed sign bits
+    residual_norms: torch.Tensor   # (...,) L2 norms of residual vectors
+    norms: torch.Tensor            # (...,) original L2 norms
+    mse_bits: int                  # bits per MSE index (for unpacking)
+
+
+class HybridQuantized(NamedTuple):
+    """
+    Hybrid quantization output: TurboQuant for regular channels,
+    full-precision for outlier channels.
+    
+    outlier_data stores the actual fp16 values of outlier channels.
+    regular_q stores TurboQuant-compressed regular channels only.
+    regular_idx is a 1D int tensor of shape (d_regular,) mapping 
+    regular channel positions back to the original d-dimensional space.
+    outlier_idx is a 1D int tensor of shape (d_outlier,) for outlier positions.
+    """
+    regular_q: ProdQuantized           # compressed regular channels
+    outlier_data: torch.Tensor         # (..., n_tokens, d_outlier) full precision
+    regular_idx: torch.Tensor          # (d_regular,) original column indices
+    outlier_idx: torch.Tensor          # (d_outlier,) original column indices
+    d_total: int                       # original head_dim
 
 
 def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
@@ -251,72 +267,34 @@ class TurboQuantProd(torch.nn.Module):
 
     def quantize(self, x: torch.Tensor) -> ProdQuantized:
         """
-        Outlier-aware quantization:
-        1. Detect outliers on pre-normalized data (preserve variance structure)
-        2. Split channels: outliers vs regular
-        3. Outliers: pass-through if outlier_bits>=8, else quantize with higher-bit codebook
-        4. Regular: apply Hadamard rotation + standard (bits-1)-bit MSE quantization + QJL
-        5. Reconstruct and return ProdQuantized
+        Standard TurboQuant inner-product quantization (no outlier handling).
         
-        Note: For simplicity, we use full-dimension rotation and codebook, but only
-        quantize the regular channels. Outliers are passed through unchanged.
+        Note: The outlier-aware logic has been moved to TurboQuantHybrid.
+        This class now handles only regular channels for the hybrid approach.
         """
         # Store norms for rescaling
         norms = x.norm(dim=-1, keepdim=False)
+        # Normalize to unit sphere
         x_unit = x / (norms.unsqueeze(-1) + 1e-10)
+
+        # Stage 1: MSE quantize at (b-1) bits
+        mse_q = self.mse_quantizer.quantize(x_unit)
         
-        # Detect outliers on pre-normalized data (before unit normalization)
-        x_pre_norm = x  # x is already the pre-normalized data
-        var = x_pre_norm.var(dim=0)  # per-channel variance across batch
-        d = x.shape[-1]
-        k = max(1, int(d * self.outlier_ratio))
-        sorted_idx = torch.argsort(var, descending=True)
-        outlier_idx = sorted_idx[:k]
-        regular_idx = sorted_idx[k:]
-        
-        # Quantize outliers: FP16 pass-through
-        if self.outlier_bits >= 8:
-            x_out_hat = x_unit[..., outlier_idx]
-            outlier_quantized = False
-        else:
-            # Placeholder: for low bit-width, still pass through
-            # Proper implementation would need separate higher-bit codebook
-            x_out_hat = x_unit[..., outlier_idx]
-            outlier_quantized = False
-        
-        # Rotate + quantize ALL channels first (standard pipeline)
-        y_all = rotate_forward(x_unit.float(), self.mse_quantizer.Pi)
-        indices_all = torch.searchsorted(self.mse_quantizer.decision_boundaries, y_all.contiguous())
-        
-        # Dequantize all to get reconstructed values
-        y_all_hat = self.mse_quantizer.centroids[indices_all]
-        x_all_hat = rotate_backward(y_all_hat, self.mse_quantizer.Pi)
-        
-        # Replace outlier channels with pass-through values
-        x_recon_unit = x_all_hat.clone()
-        x_recon_unit[..., outlier_idx] = x_out_hat
-        
-        # Rescale
-        x_recon = x_recon_unit * norms.unsqueeze(-1)
-        
-        # Compute residual for QJL stage
-        residual = x - x_recon
+        # Dequantize MSE to get residual
+        x_mse = self.mse_quantizer.dequantize(mse_q)
+        residual = x - x_mse
         residual_norms = residual.norm(dim=-1)
+        
+        # Stage 2: QJL on residual
         projected = torch.matmul(residual.float(), self.S.T)
         packed_signs = self._pack_qjl_signs(projected)
         
-        # Pack all MSE indices (including outliers, though they won't be used)
-        packed_all = _pack_indices(indices_all, self.mse_quantizer.bits)
-        
-        # Return ProdQuantized with outlier metadata
         return ProdQuantized(
-            mse_indices=packed_all,
+            mse_indices=mse_q.indices,
             qjl_signs=packed_signs,
             residual_norms=residual_norms,
             norms=norms,
-            mse_bits=self.mse_quantizer.bits,
-            outlier_indices=outlier_idx,
-            outlier_quantized=outlier_quantized,
+            mse_bits=mse_q.bits,
         )
 
     def dequantize(self, q: ProdQuantized) -> torch.Tensor:
@@ -367,3 +345,211 @@ class TurboQuantProd(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize and immediately dequantize (for testing)."""
         return self.dequantize(self.quantize(x))
+
+
+class OutlierDetector:
+    """
+    Identifies outlier channels from a running estimate of per-channel variance.
+    Call update() on the first N tokens during warmup, then call finalize()
+    to lock in the outlier/regular split. After finalize(), the split is fixed.
+    """
+    
+    def __init__(self, d: int, outlier_ratio: float = 0.08, warmup_tokens: int = 256):
+        self.d = d
+        self.outlier_ratio = outlier_ratio
+        self.warmup_tokens = warmup_tokens
+        self.n_outliers = max(1, int(d * outlier_ratio))
+        
+        self._sum_sq = torch.zeros(d)   # running sum of x^2 per channel
+        self._count = 0
+        self._finalized = False
+        
+        # Set after finalize()
+        self.outlier_idx: torch.Tensor = None   # (n_outliers,)
+        self.regular_idx: torch.Tensor = None   # (d - n_outliers,)
+    
+    def update(self, x: torch.Tensor):
+        """
+        x: (..., d) — raw key vectors (NOT normalized).
+        Accumulates per-channel variance estimate.
+        Called only during warmup.
+        Note: x can have shape (batch, tokens, d) or (1, H, tokens, d).
+        We count actual tokens processed, not just batch calls.
+        """
+        if self._finalized:
+            return
+        # Flatten batch dims, keep channel dim
+        x_flat = x.reshape(-1, self.d).float()
+        n_tokens_in_batch = x_flat.shape[0]
+        self._sum_sq = self._sum_sq.to(x_flat.device)
+        self._sum_sq += (x_flat ** 2).mean(dim=0) * n_tokens_in_batch
+        self._count += n_tokens_in_batch
+        
+        if self._count >= self.warmup_tokens:
+            self.finalize()
+    
+    def finalize(self, device=None):
+        """Lock in the outlier/regular split based on accumulated variance."""
+        if self._finalized:
+            return
+        dev = device or self._sum_sq.device
+        variance = self._sum_sq / max(self._count, 1)
+        # Top-k channels by variance are outliers
+        _, top_idx = torch.topk(variance, self.n_outliers)
+        all_idx = torch.arange(self.d, device=dev)
+        mask = torch.ones(self.d, dtype=torch.bool, device=dev)
+        mask[top_idx] = False
+        self.outlier_idx = top_idx.sort().values.to(dev)
+        self.regular_idx = all_idx[mask].to(dev)
+        self._finalized = True
+    
+    @property
+    def is_ready(self) -> bool:
+        return self._finalized
+
+
+class TurboQuantHybrid(torch.nn.Module):
+    """
+    Hybrid quantizer: TurboQuant (Hadamard rotation) for regular channels,
+    full fp16 pass-through for outlier channels.
+    
+    This directly addresses the 'outlier smearing' problem where Hadamard
+    spreads high-variance outlier channels across all coordinates, degrading
+    the distributional alignment that makes Hadamard better than dense QR.
+    
+    Usage:
+        quantizer = TurboQuantHybrid(dim=128, bits=3, outlier_ratio=0.08)
+        # During warmup (first ~256 tokens):
+        quantizer.update_detector(raw_keys)
+        # After warmup, quantizer.is_ready == True
+        q = quantizer.quantize(keys)
+        keys_recon = quantizer.dequantize(q)
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        bits: int = 3,
+        outlier_ratio: float = 0.08,
+        device: torch.device = None,
+        dtype: torch.dtype = torch.float32,
+        seed: int = 42,
+        warmup_tokens: int = 256,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.bits = bits
+        self.outlier_ratio = outlier_ratio
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.detector = OutlierDetector(dim, outlier_ratio, warmup_tokens)
+        
+        # The regular-channel quantizer is initialized with d_regular after warmup.
+        # We defer its creation until finalize() so we know the exact d_regular.
+        self._regular_quantizer: TurboQuantProd = None
+        self._seed = seed
+        self._dtype = dtype
+    
+    def update_detector(self, raw_keys: torch.Tensor):
+        """
+        Feed raw (unnormalized) key vectors to calibrate the outlier detector.
+        raw_keys: (..., d)
+        After warmup_tokens calls, the detector finalizes automatically.
+        """
+        self.detector.update(raw_keys)
+        if self.detector.is_ready and self._regular_quantizer is None:
+            self._build_regular_quantizer()
+    
+    def _build_regular_quantizer(self):
+        """Create the TurboQuantProd for regular channels only."""
+        d_reg = len(self.detector.regular_idx)
+        self._regular_quantizer = TurboQuantProd(
+            dim=d_reg,
+            bits=self.bits,
+            device=self.device,
+            dtype=self._dtype,
+            seed=self._seed,
+            rotation_type="hadamard",   # Always Hadamard for regular channels
+        )
+    
+    @property
+    def is_ready(self) -> bool:
+        return self.detector.is_ready and self._regular_quantizer is not None
+    
+    def quantize(self, x: torch.Tensor) -> HybridQuantized:
+        """
+        x: (..., n_tokens, d)
+        Returns HybridQuantized with regular channels TQ-compressed and
+        outlier channels stored as fp16.
+        """
+        assert self.is_ready, "Detector not finalized. Call update_detector() first."
+        
+        reg_idx = self.detector.regular_idx
+        out_idx = self.detector.outlier_idx
+        
+        # Split channels
+        x_regular = x[..., reg_idx]     # (..., n_tokens, d_regular)
+        x_outlier = x[..., out_idx]     # (..., n_tokens, d_outlier)
+        
+        # Quantize regular channels with TurboQuant
+        regular_q = self._regular_quantizer.quantize(x_regular)
+        
+        # Store outliers in fp16
+        outlier_data = x_outlier.to(torch.float16)
+        
+        return HybridQuantized(
+            regular_q=regular_q,
+            outlier_data=outlier_data,
+            regular_idx=reg_idx,
+            outlier_idx=out_idx,
+            d_total=self.dim,
+        )
+    
+    def dequantize(self, q: HybridQuantized) -> torch.Tensor:
+        """Reconstruct full d-dimensional vectors."""
+        x_regular = self._regular_quantizer.dequantize(q.regular_q)
+        x_outlier = q.outlier_data.to(x_regular.dtype)
+        
+        # Reconstruct in original channel order
+        batch_shape = x_regular.shape[:-1]
+        x_full = torch.empty(*batch_shape, q.d_total, 
+                             dtype=x_regular.dtype, device=x_regular.device)
+        x_full[..., q.regular_idx] = x_regular
+        x_full[..., q.outlier_idx] = x_outlier
+        return x_full
+    
+    def attention_score(
+        self, 
+        query: torch.Tensor, 
+        quantized_key: HybridQuantized,
+    ) -> torch.Tensor:
+        """
+        Compute attention scores <query, key> with hybrid quantized keys.
+        
+        This is the critical path. It splits the score into two parts:
+          score = <q_reg, k_reg_recon> + <q_out, k_out>
+        where k_reg_recon uses TurboQuant's unbiased estimator and
+        k_out is just a direct fp16 dot product.
+        
+        query: (..., n_q, d)
+        quantized_key: HybridQuantized
+        Returns: (..., n_q, n_k)
+        """
+        reg_idx = quantized_key.regular_idx
+        out_idx = quantized_key.outlier_idx
+        
+        # Split query
+        q_regular = query[..., reg_idx]   # (..., n_q, d_regular)
+        q_outlier = query[..., out_idx]   # (..., n_q, d_outlier)
+        
+        # Score from regular channels (TurboQuant unbiased estimator)
+        scores_regular = self._regular_quantizer.attention_score(q_regular, quantized_key.regular_q)
+        
+        # Score from outlier channels (exact fp16 dot product)
+        # q_outlier: (..., n_q, d_out), outlier_data: (..., n_k, d_out)
+        scores_outlier = torch.matmul(
+            q_outlier.float(), 
+            quantized_key.outlier_data.float().transpose(-2, -1)
+        )
+        
+        return scores_regular + scores_outlier
