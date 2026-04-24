@@ -172,11 +172,14 @@ class KVCaptureEngine:
 
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
-        # Feed to outlier detector if hybrid mode and not yet ready
+        # Feed to outlier detector if hybrid mode
         if hasattr(self.store, '_use_hybrid') and self.store._use_hybrid:
             if hasattr(self.store.quantizer, 'update_detector') and not self.store.quantizer.is_ready:
-                # Feed raw keys (before normalization) for variance estimation
                 self.store.quantizer.update_detector(key[:num_tokens])
+                # FORCE FINALIZE after prefill to bypass warmup_tokens limit
+                if hasattr(self.store.quantizer, 'detector') and not self.store.quantizer.detector._finalized:
+                    self.store.quantizer.detector.finalize(device=key.device)
+                    self.store.quantizer._build_regular_quantizer()
         
         if num_tokens <= self.ring.capacity:
             self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
