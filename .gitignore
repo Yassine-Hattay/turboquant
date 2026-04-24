@@ -5,18 +5,36 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Dependencies
-.venv/
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
 venv/
+.venv/
 env/
-.env
-.env.local
-.env.*
+.ENV/
 
 # Logs
 *.log
 
-# Coverage
+# Temporary files
+*.tmp
+*.swp
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage reports
 .coverage
 coverage/
 htmlcov/
@@ -24,9 +42,4 @@ htmlcov/
 # Testing
 .pytest_cache/
 .mypy_cache/
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
 ```

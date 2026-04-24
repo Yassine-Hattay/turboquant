@@ -575,35 +575,42 @@ class TurboQuantHybrid(torch.nn.Module):
         N = k_regular.shape[-2]
         
         # Expand query to match key batch dimensions if needed
-        # If keys have batch shape () (scalar), query should be (T_q, H_kv, d)
-        # If keys have batch shape (H_kv,), query should be (T_q, H_kv, d)
-        # If keys have batch shape (batch, H_kv,), query should be (T_q, batch, H_kv, d)
-        
         # For simplicity, handle common cases:
         if len(key_batch_shape) == 0:
             # Keys are (N, d), no batch dims - shouldn't happen in practice
             scores_regular = torch.einsum("thd,nd->thn", q_regular.float(), k_regular.float())
             scores_outlier = torch.einsum("thd,nd->thn", q_outlier.float(), outlier_data.float())
+            # Combine H_kv and G back to Q dimension
+            scores = (scores_regular + scores_outlier).reshape(T_q, -1, N)
         elif len(key_batch_shape) == 1:
             # Keys are (H_kv, N, d)
             scores_regular = torch.einsum("thd,hnd->thn", q_regular.float(), k_regular.float())
             scores_outlier = torch.einsum("thd,hnd->thn", q_outlier.float(), outlier_data.float())
+            # Reshape from (T_q, H_kv, N) to (T_q, Q, N) where Q = H_kv * G
+            # We need to expand along G dimension
+            scores = (scores_regular + scores_outlier).unsqueeze(2).expand(T_q, H_kv, G, N)
+            scores = scores.reshape(T_q, H_kv * G, N)
         elif len(key_batch_shape) == 2:
             # Keys are (batch, H_kv, N, d) or (1, H_kv, N, d)
-            # Query is (T_q, H_kv, d), need to expand to (T_q, batch, H_kv, d)
             if key_batch_shape[0] == 1:
                 # Squeeze the leading 1 dim
                 k_regular = k_regular.squeeze(0)  # (H_kv, N, d)
                 outlier_data = outlier_data.squeeze(0)  # (H_kv, N, d_out)
                 scores_regular = torch.einsum("thd,hnd->thn", q_regular.float(), k_regular.float())
                 scores_outlier = torch.einsum("thd,hnd->thn", q_outlier.float(), outlier_data.float())
+                # Reshape from (T_q, H_kv, N) to (T_q, Q, N)
+                scores = (scores_regular + scores_outlier).unsqueeze(2).expand(T_q, H_kv, G, N)
+                scores = scores.reshape(T_q, H_kv * G, N)
             else:
                 # General case: use broadcasting
                 # q: (T_q, H_kv, d), k: (B, H_kv, N, d)
                 # Result: (T_q, B, H_kv, N)
                 scores_regular = torch.einsum("thd,bhnd->tbhn", q_regular.float(), k_regular.float())
                 scores_outlier = torch.einsum("thd,bhnd->tbhn", q_outlier.float(), outlier_data.float())
+                scores = scores_regular + scores_outlier
+                # Reshape to (T_q, B*H_kv*G, N) or keep as is depending on usage
+                # For now, keep as (T_q, B, H_kv, N) - caller should handle
         else:
             raise ValueError(f"Unsupported key batch shape: {key_batch_shape}")
         
-        return scores_regular + scores_outlier
+        return scores
