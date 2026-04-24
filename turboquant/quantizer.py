@@ -531,25 +531,79 @@ class TurboQuantHybrid(torch.nn.Module):
         where k_reg_recon uses TurboQuant's unbiased estimator and
         k_out is just a direct fp16 dot product.
         
-        query: (..., n_q, d)
-        quantized_key: HybridQuantized
-        Returns: (..., n_q, n_k)
+        query: (T_q, Q, d) or (T_q, H_kv, G, d) — typically (batch, num_query_heads, d)
+               For decode: T_q=1, for prefill: T_q=num_prefill_tokens
+        quantized_key: HybridQuantized with shapes (..., N, ...) where ... can be batch dims
+                       Common patterns:
+                       - Direct quantization: (batch, H_kv, N, d_xxx)
+                       - After flatten: (H_kv, N, d_xxx)  [no leading batch dim]
+        Returns: (T_q, ..., N) — scores per query token and key position
         """
         reg_idx = quantized_key.regular_idx
         out_idx = quantized_key.outlier_idx
         
-        # Split query
-        q_regular = query[..., reg_idx]   # (..., n_q, d_regular)
-        q_outlier = query[..., out_idx]   # (..., n_q, d_outlier)
+        # Handle GQA: query can be (T_q, Q, d) or already split as (T_q, H_kv, G, d)
+        if query.dim() == 3:
+            # query: (T_q, Q, d) where Q = H_kv * gqa_ratio
+            T_q, Q, d = query.shape
+            # Reshape to (T_q, H_kv, G, d)
+            # We need to infer H_kv from the quantized_key shapes
+            # outlier_data shape: (..., N, d_out) - get H_kv from second-to-last dim if >2D, or assume 1 head
+            if quantized_key.outlier_data.dim() == 3:
+                H_kv = quantized_key.outlier_data.shape[0]
+            else:
+                H_kv = Q // (Q // 4)  # Assume GQA ratio of 8 by default, fallback
+            G = Q // H_kv
+            query_4d = query.view(T_q, H_kv, G, d)
+        elif query.dim() == 4:
+            # query: (T_q, H_kv, G, d) — already split for GQA
+            T_q, H_kv, G, d = query.shape
+            query_4d = query
+        else:
+            raise ValueError(f"Unexpected query shape: {query.shape}")
         
-        # Score from regular channels (TurboQuant unbiased estimator)
-        scores_regular = self._regular_quantizer.attention_score(q_regular, quantized_key.regular_q)
+        # Average over G dimension to get per-KV-head queries
+        q_regular = query_4d[..., reg_idx].mean(dim=2)   # (T_q, H_kv, d_regular) or (T_q, ..., d_regular)
+        q_outlier = query_4d[..., out_idx].mean(dim=2)   # (T_q, H_kv, d_outlier) or (T_q, ..., d_outlier)
         
-        # Score from outlier channels (exact fp16 dot product)
-        # q_outlier: (..., n_q, d_out), outlier_data: (..., n_k, d_out)
-        scores_outlier = torch.matmul(
-            q_outlier.float(), 
-            quantized_key.outlier_data.float().transpose(-2, -1)
-        )
+        # Dequantize regular keys
+        k_regular = self._regular_quantizer.dequantize(quantized_key.regular_q)  # (..., N, d_reg)
+        outlier_data = quantized_key.outlier_data  # (..., N, d_out)
+        
+        # Determine the batch shape of keys (everything except last two dims: N and d)
+        key_batch_shape = k_regular.shape[:-2]
+        N = k_regular.shape[-2]
+        
+        # Expand query to match key batch dimensions if needed
+        # If keys have batch shape () (scalar), query should be (T_q, H_kv, d)
+        # If keys have batch shape (H_kv,), query should be (T_q, H_kv, d)
+        # If keys have batch shape (batch, H_kv,), query should be (T_q, batch, H_kv, d)
+        
+        # For simplicity, handle common cases:
+        if len(key_batch_shape) == 0:
+            # Keys are (N, d), no batch dims - shouldn't happen in practice
+            scores_regular = torch.einsum("thd,nd->thn", q_regular.float(), k_regular.float())
+            scores_outlier = torch.einsum("thd,nd->thn", q_outlier.float(), outlier_data.float())
+        elif len(key_batch_shape) == 1:
+            # Keys are (H_kv, N, d)
+            scores_regular = torch.einsum("thd,hnd->thn", q_regular.float(), k_regular.float())
+            scores_outlier = torch.einsum("thd,hnd->thn", q_outlier.float(), outlier_data.float())
+        elif len(key_batch_shape) == 2:
+            # Keys are (batch, H_kv, N, d) or (1, H_kv, N, d)
+            # Query is (T_q, H_kv, d), need to expand to (T_q, batch, H_kv, d)
+            if key_batch_shape[0] == 1:
+                # Squeeze the leading 1 dim
+                k_regular = k_regular.squeeze(0)  # (H_kv, N, d)
+                outlier_data = outlier_data.squeeze(0)  # (H_kv, N, d_out)
+                scores_regular = torch.einsum("thd,hnd->thn", q_regular.float(), k_regular.float())
+                scores_outlier = torch.einsum("thd,hnd->thn", q_outlier.float(), outlier_data.float())
+            else:
+                # General case: use broadcasting
+                # q: (T_q, H_kv, d), k: (B, H_kv, N, d)
+                # Result: (T_q, B, H_kv, N)
+                scores_regular = torch.einsum("thd,bhnd->tbhn", q_regular.float(), k_regular.float())
+                scores_outlier = torch.einsum("thd,bhnd->tbhn", q_outlier.float(), outlier_data.float())
+        else:
+            raise ValueError(f"Unsupported key batch shape: {key_batch_shape}")
         
         return scores_regular + scores_outlier

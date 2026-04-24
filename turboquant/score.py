@@ -150,23 +150,23 @@ def _attend_hybrid(
     
     if isinstance(flat.prod_q, HybridQuantized):
         # Hybrid path: use quantizer's attention_score for history
-        scores_hist = quantizer.attention_score(query, flat.prod_q)
-        v_hist = dequantize_values(flat.value_q, 32)
+        # Reshape query to (T, H_kv, G, D) for proper GQA handling
+        T = query.shape[0]
+        query_4d = query.float().view(T, num_kv_heads, gqa_ratio, head_dim)
+        
+        scores_hist = quantizer.attention_score(query_4d, flat.prod_q)  # (T, H_kv, N_hist)
+        v_hist = dequantize_values(flat.value_q, 32)  # (H_kv, N_hist, D)
         
         # Recent keys/values are already in exact form
         k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
         v_recent = recent_v.transpose(0, 1)
         
         # Compute scores for recent part
-        # query: (T, Q, D) = (T, H_kv * gqa_ratio, D)
-        # k_recent: (H_kv, N_recent, D)
-        # Need to compute per-group scores: (T, H_kv, gqa_ratio, N_recent)
-        T = query.shape[0]
-        q_for_recent = query.float().view(T, num_kv_heads, gqa_ratio, head_dim)  # (T, H_kv, G, D)
+        # query_4d: (T, H_kv, G, D)
         # k_recent_float: (H_kv, N_recent, D)
         k_recent_float = k_recent.float()
         # scores: (T, H_kv, G, N_recent) = <q[T,H_kv,G,D], k[H_kv,N_recent,D]>
-        scores_recent = torch.einsum("thgd,hnd->thgn", q_for_recent, k_recent_float) * scale
+        scores_recent = torch.einsum("thgd,hnd->thgn", query_4d, k_recent_float) * scale
         
         # scores_hist: (T, H_kv, N_hist) -> expand to (T, H_kv, G, N_hist)
         scores_hist_expanded = scores_hist.unsqueeze(2).expand(-1, -1, gqa_ratio, -1)
