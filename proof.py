@@ -28,6 +28,8 @@ def run_phase(name, script):
     env["CUDA_VISIBLE_DEVICES"] = GPUS
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + ":" + env.get("PYTHONPATH", "")
+
     
     # Debug logging before subprocess call
     print(f"[DEBUG] Running: {path} with env CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}", flush=True)
